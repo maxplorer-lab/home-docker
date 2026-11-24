@@ -51,7 +51,7 @@ export function createApp({ tracking } = {}) {
   const app = new Hono()
 
   // Health check for the container (and for a Fly health check).
-  app.get('/healthz', (c) => c.json({ ok: true, app: 'home-sompitra', tracking: true }))
+  app.get('/healthz', (c) => c.json({ ok: true, app: 'home-superapp', tracking: true }))
 
   // The service worker belongs to the full cloud build (it caches /shared and
   // is wired to the module assets). Here it would only serve stale pages.

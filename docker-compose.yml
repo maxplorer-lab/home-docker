@@ -1,7 +1,7 @@
 services:
   home:
     build: .
-    container_name: home-sompitra
+    container_name: home-superapp
     restart: unless-stopped
     # The Worker gets this long to flush and close its SQLite files.
     stop_grace_period: 30s

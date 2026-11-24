@@ -22,7 +22,7 @@
 #   fly deploy --ha=false
 #   fly machine list          # must print exactly one machine
 
-app = "home-sompitra"
+app = "home-superapp"
 primary_region = "jnb"          # Johannesburg — closest to Madagascar
 
 [build]
