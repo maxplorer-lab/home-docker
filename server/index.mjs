@@ -1,10 +1,16 @@
 import { serve } from '@hono/node-server'
 import { ensureDataDir } from './config.mjs'
 import { migrateAll } from './migrate.mjs'
-import { createApp } from './app.mjs'
 import { createEnv } from './env.mjs'
 import { createTracking } from './tracking.mjs'
 import { attachRealtime } from './realtime.mjs'
+
+// This legacy port mounts only Sompitra, Meds and You. app-chrome.tsx reads the
+// tab list once at module evaluation, so the environment has to be set BEFORE
+// app.mjs (and therefore app-chrome.tsx) is imported.
+process.env.HOME_TABS = process.env.HOME_TABS || 'money,meds,settings'
+process.env.HOME_TRACKING = process.env.HOME_TRACKING || '1'
+const { createApp } = await import('./app.mjs')
 
 ensureDataDir()
 migrateAll()

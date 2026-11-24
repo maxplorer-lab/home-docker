@@ -196,30 +196,28 @@ export const SOMPITRA_SECTIONS = ['budget', 'kine', 'debts', 'sales']
 /**
  * Which tabs THIS deployment serves.
  *
- * The Cloudflare build leaves this unset — all six tabs, unchanged. The SQLite
- * container calls `configureChrome` once at boot with the screens it actually
- * mounts, so a tab can never point at a module that was left out. This is
- * startup configuration, never request data (see rule 38): it is written once
- * and only read afterwards.
+ * The Worker serves all six, unchanged: with nothing configured, `enabledTabs()`
+ * is `HOME_TABS`. The legacy Node port mounts only Sompitra, Meds and You, so
+ * it sets `HOME_TABS=money,meds,settings` before importing the app, and
+ * `HOME_TRACKING=1` turns on its `/track` link.
+ *
+ * This is boot configuration read ONCE, when the module is evaluated — never
+ * request data, and nothing writes it afterwards. That matters beyond taste:
+ * a module-scope binding written from inside a function is shared by every
+ * concurrent request in the isolate (rule 38).
  */
-let ENABLED_TABS: readonly string[] | null = null
-
-/** The container's live-tracking page (`/track`). The Cloudflare build leaves
- *  this false: its map is the WAY tab, and a second tracking surface there
- *  would be a second source of truth. */
-let TRACKING_ENABLED = false
-
-export function configureChrome(options: { tabs?: string[]; tracking?: boolean }): void {
-  ENABLED_TABS = options.tabs && options.tabs.length > 0 ? [...options.tabs] : null
-  TRACKING_ENABLED = options.tracking === true
-}
+const BOOT_ENV = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+const ENABLED_TAB_KEYS: readonly string[] | null = BOOT_ENV?.HOME_TABS
+  ? BOOT_ENV.HOME_TABS.split(',').map((key) => key.trim()).filter(Boolean)
+  : null
+const TRACKING_ENABLED = BOOT_ENV?.HOME_TRACKING === '1'
 
 export function trackingEnabled(): boolean {
   return TRACKING_ENABLED
 }
 
 export function enabledTabs() {
-  return ENABLED_TABS ? HOME_TABS.filter((t) => ENABLED_TABS!.includes(t.tab)) : HOME_TABS
+  return ENABLED_TAB_KEYS ? HOME_TABS.filter((t) => ENABLED_TAB_KEYS.includes(t.tab)) : HOME_TABS
 }
 
 /** The theme/tab colour for an active key — used for `<meta theme-color>`

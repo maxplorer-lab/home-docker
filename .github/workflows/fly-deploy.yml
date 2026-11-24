@@ -1,0 +1,40 @@
+name: Deploy to Fly.io
+
+# Manual on purpose: this app is single-writer SQLite + one always-on machine,
+# so a deploy is a deliberate act, not a side effect of a commit. Set the
+# FLY_API_TOKEN secret first (`fly tokens create deploy -a home-sompitra`),
+# then run this workflow from the Actions tab.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require FLY_API_TOKEN
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::error::Add a repository secret named FLY_API_TOKEN (fly tokens create deploy -a home-sompitra)."
+            exit 1
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy one machine
+        run: flyctl deploy --remote-only --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Confirm the machine count
+        run: |
+          flyctl machine list -a "$(grep -m1 '^app' fly.toml | cut -d'"' -f2)"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

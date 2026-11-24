@@ -1,15 +1,22 @@
 // ─── Container configuration ────────────────────────────────────
 // Two SQLite files, matching the two databases the Cloudflare build uses:
 //
-//   home.sqlite      HOME_DB + WAY_DB   (central identity. WAY is not mounted
-//                                        in this build, but the binding stays
-//                                        so provisioning code keeps working.)
-//   sompitra.sqlite  DB + LAOKA_DB      (Sompitra finance + the medications
-//                                        table; Laoka is not mounted.)
+//   home.sqlite      HOME_DB + WAY_DB   (central identity, WAY users, the
+//                                        chat/WAY flush targets)
+//   sompitra.sqlite  DB + LAOKA_DB      (Sompitra finance, medications,
+//                                        Laoka)
 //
 // Keeping them separate is not cosmetic: both schemas define `users` and
 // `sessions`, so one file would collide. It also means each Cloudflare D1
 // export drops straight into its own file.
+//
+// The files workerd actually opens live under `data/state/` and carry a hashed
+// name; the friendly paths above are SYMLINKS for people and backups. Every
+// Node tool therefore opens the path in `data/state/d1-paths.json` (written by
+// server/worker-entry.mjs, relative to DATA_DIR) rather than the link: SQLite
+// derives its -wal/-shm
+// names from the path it was given, so opening the link would give one
+// database two WAL sidecars and two uncoordinated writers.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -17,8 +24,22 @@ import crypto from 'node:crypto'
 
 export const ROOT = process.cwd()
 export const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'))
-export const HOME_FILE = path.join(DATA_DIR, 'home.sqlite')
-export const SOMPITRA_FILE = path.join(DATA_DIR, 'sompitra.sqlite')
+
+function liveDatabase(fallback, key) {
+  try {
+    const map = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'state', 'd1-paths.json'), 'utf8'))
+    const target = map && map[key]
+    // The map is relative to DATA_DIR; an older absolute entry still resolves.
+    const resolved = typeof target === 'string' ? path.resolve(DATA_DIR, target) : null
+    if (resolved && fs.existsSync(resolved)) return resolved
+  } catch {
+    // No live mapping yet (a fresh install, or the Node-only build).
+  }
+  return fallback
+}
+
+export const HOME_FILE = liveDatabase(path.join(DATA_DIR, 'home.sqlite'), 'home')
+export const SOMPITRA_FILE = liveDatabase(path.join(DATA_DIR, 'sompitra.sqlite'), 'sompitra')
 
 export function ensureDataDir() {
   fs.mkdirSync(DATA_DIR, { recursive: true })
@@ -52,6 +73,13 @@ export function loadSecret(name, { min = 16, file } = {}) {
 
 export function alertSecretFallback(name) {
   if ((process.env[name] || '').trim().length >= 16) return
+  // A saved secret is not a fallback: it is the value the app has been using,
+  // and warning about it every time a tool runs is just noise (and wrong).
+  try {
+    if (fs.readFileSync(path.join(DATA_DIR, name.toLowerCase()), 'utf8').trim().length >= 16) return
+  } catch {
+    // no saved value either
+  }
   console.warn(
     `[home] ${name} was not set — using a generated secret from ${DATA_DIR}.\n` +
     `[home] Imported passwords will NOT verify unless ${name} matches the one ` +

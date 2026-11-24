@@ -3,7 +3,8 @@
   "version": "2.0.0",
   "private": true,
   "scripts": {
-    "start": "tsx server/index.mjs",
+    "start": "node server/worker-entry.mjs",
+    "start:node": "tsx server/index.mjs",
     "migrate:sqlite": "node server/migrate.mjs",
     "import:sql": "node server/import.mjs sql",
     "import:csv": "node server/import.mjs csv",

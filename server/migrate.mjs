@@ -27,6 +27,12 @@ const SOMPITRA_MIGRATIONS = path.join(ROOT, 'migrations-sompitra')
 // to a third file. 0000_baseline.sql must run first: 0001 assumes the baseline
 // tables already exist.
 const WAY_MIGRATIONS = path.join(ROOT, 'migrations-way')
+const LAOKA_MIGRATIONS = path.join(ROOT, 'migrations-laoka')
+// Laoka shares sompitra.sqlite (DB + LAOKA_DB are one database since the
+// 2026-10-06 merge), so its files are applied to the SAME file. `resume`
+// matters here: once laoka_users exists every later boot would otherwise take
+// the "imported schema" path and STAMP a new Laoka migration without running
+// it, leaving the app on yesterday's schema.
 const WAY_REPAIR = path.join(ROOT, 'scripts', 'repair-way-messages-fk.sql')
 
 /** Split a migration file into statements, respecting quotes and comments. */
@@ -101,11 +107,15 @@ function ensureLedger(db) {
 /**
  * Apply `dir` to `db`, or record it as already present.
  *
+ * `resume` is for a module whose tables live BESIDE another schema's in the
+ * same file (Laoka in sompitra.sqlite): the sentinel exists from the first
+ * boot onward, but that must not stop a later migration from being applied.
+ *
  * @param {Database} db
  * @param {string} dir
- * @param {{ sentinel: string, label: string, quiet?: boolean }} opts
+ * @param {{ sentinel: string, label: string, quiet?: boolean, reject?: string, resume?: boolean }} opts
  */
-export function migrateDatabase(db, dir, { sentinel, reject, label, quiet = false }) {
+export function migrateDatabase(db, dir, { sentinel, reject, label, quiet = false, resume = false }) {
   const existing = tableNames(db).filter((t) => t !== 'schema_migrations')
   ensureLedger(db)
 
@@ -118,7 +128,7 @@ export function migrateDatabase(db, dir, { sentinel, reject, label, quiet = fals
     .filter((f) => f.endsWith('.sql'))
     .sort()
 
-  const imported = existing.includes(sentinel)
+  const imported = !resume && existing.includes(sentinel)
 
   // A database belonging to the OTHER schema is a wrong --db, not something to
   // migrate. Both schemas have `users`/`sessions`, so this is the check that
@@ -287,7 +297,17 @@ export function migrateAll({ quiet = false } = {}) {
       label: 'sompitra',
       quiet,
     })
-    return { home: homeResult, way: wayResult, sompitra: sompitraResult }
+    // Laoka's tables live in this same file (LAOKA_DB → sompitra.sqlite), so
+    // they are applied after Sompitra's. `resume` keeps a later boot from
+    // stamping a new file it never ran.
+    const laokaResult = migrateDatabase(sompitra, LAOKA_MIGRATIONS, {
+      sentinel: 'laoka_users',
+      reject: 'home_settings',
+      label: 'laoka',
+      quiet,
+      resume: true,
+    })
+    return { home: homeResult, way: wayResult, sompitra: sompitraResult, laoka: laokaResult }
   } finally {
     home.close()
     sompitra.close()
@@ -299,6 +319,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   console.log(
     `[home] done — home: ${result.home.applied.length} applied, ` +
     `way: ${result.way.applied.length} applied, ` +
-    `sompitra: ${result.sompitra.applied.length} applied`
+    `sompitra: ${result.sompitra.applied.length} applied, ` +
+    `laoka: ${result.laoka.applied.length} applied`
   )
 }

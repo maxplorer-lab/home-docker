@@ -12,7 +12,6 @@
 import { Hono } from 'hono'
 import { serveStatic } from '@hono/node-server/serve-static'
 
-import { configureChrome } from '../src/views/app-chrome'
 import { handleIngest } from '../src/way/routes/ingest'
 import * as authModule from '../src/routes/auth'
 import * as dashboardModule from '../src/routes/dashboard'
@@ -41,11 +40,10 @@ function appOf(mod, name) {
   return value
 }
 
-// The tab bar and the desktop nav both read this one list. Sompitra's sections
-// share the `money` tab; Meds and You are the only other screens this build
-// actually serves. `tracking` turns on the dashboard's link to /track — the
-// Cloudflare build leaves it off because its map is the WAY tab.
-configureChrome({ tabs: ['money', 'meds', 'settings'], tracking: true })
+// The tab bar and the desktop nav read HOME_TABS. This build mounts only
+// Sompitra, Meds and You, so server/index.mjs sets HOME_TABS and HOME_TRACKING
+// in the environment BEFORE importing this module; app-chrome.tsx reads them
+// once at boot. Nothing here writes module scope (rule 38).
 
 export function createApp({ tracking } = {}) {
   if (!tracking) throw new Error('createApp needs the tracking pipeline')

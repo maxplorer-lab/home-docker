@@ -7,13 +7,12 @@
 #   * /data is the only durable place — the container's own filesystem is
 #     replaced on every deploy.
 #
-# Sized for Fly's Free plan (a $5/month usage allowance), which is why the VM
-# is 256 MB: the built image measures ~82 MB RSS after boot and ~83 MB after
-# 100 requests (DOCKER.md → Cost). At 256 MB this app is ~$3.01/month in jnb,
-# leaving ~$2 of headroom; at 512 MB it is ~$4.96, and a 31-day month or a
-# burst of traffic crosses the allowance — which bills the WHOLE month at
-# standard rates instead of just the excess. Set a billing alert in the
-# dashboard, and only raise this value after measuring (fly machine status).
+# The full Worker runtime (workerd + the Wrangler supervisor) needs 512 MB;
+# the earlier 256 MB figure belonged to the stripped Node port, which is no
+# longer what runs. That is ~$4.96/month in jnb against Fly's $5 allowance, so
+# a 31-day month or a burst of traffic can cross it — which bills the whole
+# month at standard rates instead of just the excess. Keep a billing alert on
+# and check `fly machine status` after a deploy (DOCKER.md → Cost).
 #
 # Create the volume once, in the same region:
 #   fly volumes create home_data --region jnb --size 1
@@ -49,10 +48,13 @@ primary_region = "jnb"          # Johannesburg — closest to Madagascar
 [[http_service.checks]]
   interval = "30s"
   timeout = "5s"
-  grace_period = "15s"
+  # The Worker runtime (workerd) bundles and boots before /login answers.
+  grace_period = "45s"
   method = "GET"
-  path = "/healthz"
+  path = "/login"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  # 512 MB: workerd plus the Wrangler supervisor measured ~432 MB in
+  # `docker stats` with the full super app loaded. 256 MB is not enough.
+  memory = "512mb"

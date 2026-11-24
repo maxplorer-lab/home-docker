@@ -3,10 +3,13 @@ services:
     build: .
     container_name: home-sompitra
     restart: unless-stopped
+    # The Worker gets this long to flush and close its SQLite files.
+    stop_grace_period: 30s
     ports:
       - "${PORT:-8080}:8080"
     volumes:
-      # Both SQLite files live here: home.sqlite + sompitra.sqlite.
+      # Live D1/DO state under state/; home.sqlite and sompitra.sqlite are
+      # stable symlinks to it for people, backups and the Node tools.
       - ./data:/data
     environment:
       # REQUIRED for a seamless migration: the same pepper the Cloudflare

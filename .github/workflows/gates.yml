@@ -1,0 +1,188 @@
+name: Gates
+
+# What a pull request must pass before it can be merged, and what `main` must
+# pass after a push so a regression is visible on the branch that deploys.
+#
+# Why this is a gate and not a habit. The checks below are exactly the
+# ones that cannot report their own absence: `tsc` passes because nothing is
+# wrongly typed, the module-scope audit passes because no binding is written,
+# the Durable Object audit passes because every field is declared, the
+# rule→guard audit passes because every declared guard resolves, and the
+# basemap audit passes because the RECORDED upstream still satisfies its rules.
+# So a pull
+# request that reintroduces request state looks identical to a clean one unless
+# something runs the audits — and a pull request that quietly WEAKENS an
+# analyzer looks clean too, in every case. Hence two jobs: `gates` runs the
+# checks, and `guards` runs the falsification drivers that prove the checks can
+# still go red at all. A gate nobody has seen fail is not a gate.
+#
+# Nothing here needs a dev server, a database, a secret or the network: every
+# step is read-only source analysis (plus `npm ci`). That is what makes it safe
+# on every pull request, including one opened from a fork — there is nothing to
+# withhold, because nothing is authenticated.
+#
+# `npm run smoke` is deliberately NOT here. It needs `wrangler dev` running, a
+# local D1 seeded with the dev account, and a resolved identity session, so it
+# belongs on a real machine (`npm run verify`) rather than in a check that has
+# to be quick and deterministic on every PR. The audits are the half of that
+# suite which needs none of it; smoke §24, §25 and §28 run the same three scans
+# against the running app, so between them nothing is lost.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: Type gate + shared-state audits
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `tsc --noEmit` over src/. The compiler and the Workers types both come
+      # from devDependencies, so this step needs nothing but the install above.
+      - name: Type gate
+        run: npm run check
+
+      # rule 38. A module-scope binding written from inside a function is shared
+      # state between every concurrent request in the isolate; the one that
+      # shipped was `let lastPassword` in src/identity.ts, where two overlapping
+      # logins could hash one person's password into another person's row.
+      - name: No request data in module scope
+        run: npm run audit:module-state
+
+      # rule 39. The same bug one level down: a DO field assigned from request
+      # data and read past an `await` belongs to whichever request interleaves,
+      # while looking exactly like ordinary object state.
+      - name: No request data parked on a Durable Object
+        run: npm run audit:do-state
+
+      # rule 44. The docs' own promises: every numbered rule in AGENTS.md
+      # declares its guards in the rule→guard map, every declared guard resolves
+      # (a smoke section, an audit: script, a driver file) and every § citation
+      # in the repo names a section that exists. It reads files only, so a rule
+      # whose guard was renamed away fails here instead of reading as a promise.
+      - name: Every declared guard and citation still resolves
+        run: npm run audit:rules
+
+      # rule 45. The other half of the type gate: `npm run check` stops at the
+      # extension (`checkJs: false`), so every .js file under src/ was parsed and
+      # never looked at. This pass runs the compiler over all of them with one
+      # declared relaxation (noImplicitAny) and refuses to answer if any other
+      # option moved. Read-only, no server.
+      - name: Every .js under src/ typechecks
+        run: npm run audit:laoka-types
+
+      # rule 46. Every fact a client caches declares a carrier (the connect
+      # snapshot, a change signal, a re-read on reconnect/visible) and the code
+      # still has it — a fence added on one device must reach the page open on
+      # the other. Read-only; it also refuses to report clean when a source it
+      # reads is missing, because "nothing to check" and "nothing wrong" must
+      # not look alike.
+      - name: Every cached fact still has a carrier
+        run: npm run audit:client-state
+
+      # rule 47. Every function the app ships, over src/ and the pages: nothing
+      # starts async work and drops the promise, no catch empties itself without
+      # saying why, no await is lost in a forEach/map/filter callback. Read-only,
+      # no server, and it reports how many call sites rest on a page's rejection
+      # net rather than hiding them.
+      - name: Every started call is carried
+        run: npm run audit:functions
+
+      # rule 41. The basemap checks judge somebody else's server — a style JSON,
+      # its TileJSON and one real tile — so they judge a RECORD of it
+      # (scripts/fixtures/basemaps/, refreshed deliberately with
+      # `npm run basemaps:record`) rather than the network. That is what makes
+      # this step possible at all: the same walk and the same judgment as smoke §9,
+      # with no dev server, no database and no network. It fails when the
+      # record is missing or older than the staleness bound, when a declared key
+      # has no recorded bytes, or when the recorded upstream breaks a basemap
+      # rule — and a check here that quietly went back to fetching upstream is
+      # refused rather than answered.
+      - name: The recorded basemap upstream still satisfies its rules
+        run: npm run audit:basemaps
+
+  guards:
+    name: The audits can still fail
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Separate job on a separate runner, for two reasons: it MUTATES files
+    # (temporarily), which must never overlap a job that reads them; and a
+    # failure here means something different from a failure in `gates` — the
+    # app is not necessarily wrong, the guard around it may be blind.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Each driver extracts one smoke section, applies one fault at a time, and
+      # asks whether the check that exists for it actually goes red. Both need
+      # no server. Both restore every file with the sha256 they started with and
+      # exit 2 if the tree does not come back byte-identical, so a mutation can
+      # never leak into a later step. Three separate analyzer variants reported
+      # a permanently green tree while these audits were being built (a set of
+      # `SyntaxKind` NAMES compared against `node.kind` NUMBERS; a method's own
+      # parameters never seeded onto the scope stack; that stack compared
+      # against names without being flattened), which is what this job is for.
+      - name: Module scope — every mutation still caught
+        run: node scripts/one-off/2026-09-23-module-state/mutate.mjs
+
+      - name: Durable Object — every mutation still caught
+        run: node scripts/one-off/2026-09-23-do-state/mutate.mjs
+
+      # The rule→guard audit is a scanner over the docs, so it needs its own
+      # driver for the same reason: while the map was being written, the
+      # `audit:` cell resolved its script by the SUFFIX (`pkg.scripts['do-state']`)
+      # instead of the name the cell carries, and every audit row would have
+      # read as a missing script with nothing to say so. M8 is that fault.
+      - name: Rule → guard map — every mutation still caught
+        run: node scripts/one-off/2026-09-27-rule-guards/mutate.mjs
+
+      # The JavaScript type pass walks src/ rather than reading a list, so its
+      # driver proves the walk catches a file that did not exist a second ago —
+      # and that a loosened option set is refused rather than trusted.
+      - name: JavaScript type pass — every mutation still caught
+        run: node scripts/one-off/2026-09-27-laoka-types/mutate.mjs
+
+      # The basemap audit's subject is a RECORD of somebody else's tile host
+      # kept in this repo, so its driver needs no server and runs in seconds —
+      # six faults: no record, a tile URL the record has no bytes for, the
+      # open-water tile handed over as the household's own view, an emptied
+      # requirement, a record past the staleness bound, and a disarmed offline
+      # ban (the audit answers from the network and must say so rather than
+      # pass). Its sibling,
+      # scripts/one-off/2026-09-30-basemap-names/mutate.mjs, covers the half
+      # that needs the running app and is deliberately NOT here.
+      - name: Basemap record — every mutation still caught
+        run: node scripts/one-off/2026-09-30-basemap-record/mutate.mjs
