@@ -253,14 +253,70 @@ hand-made export:
 * **Dates** accept `YYYY-MM-DD` and `DD/MM/YYYY`; anything else is parsed by
   JavaScript's `Date`.
 * **Amounts** may carry `Ar`, spaces, commas or a decimal point; a typed
-  `1250.75` is read as 1,250 (the app's own whole-Ariary rule).
+  `1250.75` is read as 1,250 (the app's own whole-Ariary rule). The report's own
+  headers `Amount (MGA)` and `Income Source` are recognized as they are.
 * **Names instead of ids**: `category` + `group`, `account` and `added_by` are
   resolved case-insensitively, and missing groups/categories/accounts/users are
   created (a group defaults to `Imported`). `category_id`,
   `income_account_id` and `added_by_user_id` are used when present.
 * **Missing `type`** means expense. Accepts `income`/`in` (and `credit`).
-* **Ids** are optional; a row without one gets a UUID. `INSERT OR REPLACE` makes
-  a re-import update the same row.
+* **Ids** are optional; a row without one gets a UUID. A re-import of a file
+  that carries ids updates the same row — except `users`, where an existing
+  username is kept: replacing it would change the id every transaction,
+  contract and payment points at. A report without ids therefore imports once;
+  a second run would add its rows again.
+
+### Household accounts (a CSV carries history, not logins)
+
+`sompitra.sqlite.users` has no usable password — the login lives in
+`home.sqlite` — so create the two people after importing. One command writes
+the central login, the Sompitra row (matched by username, so the imported
+history keeps its attribution) and the `way_users` row the phone
+authenticates with, all with the same password:
+
+```bash
+docker compose run --rm home ./node_modules/.bin/tsx server/users.mjs set maxx \
+  --name MaxX --admin
+docker compose run --rm home ./node_modules/.bin/tsx server/users.mjs set niri \
+  --name Niri
+```
+
+Without `--password` a strong one is generated and printed once; pass
+`--password '…'` to choose it. `--admin` is the central role (and Sompitra's
+`is_admin` fallback); without it the account is a member. Running `set` again
+resets that person's password everywhere — browser and phone — without touching
+their id. `list` shows every account, which module rows exist, and whether a
+first-sign-in link is open.
+
+### Letting them choose their own password (`--invite`)
+
+`--invite` creates the account and prints a **one-time first-sign-in link**
+instead of handing out a password. The person opens it, picks their own
+password, and is signed in:
+
+```bash
+docker compose run --rm home ./node_modules/.bin/tsx server/users.mjs set maxx \
+  --name MaxX --admin --invite
+# [users]   first sign-in link (one-time, 14 days):
+# [users]     /claim?token=…
+```
+
+Prefix that path with the site's address (`http://localhost:8080/claim?token=…`),
+or set `PUBLIC_URL` and the command prints the whole URL. The token is shown
+once and stored only as a SHA-256 hash, so a lost link is replaced by running
+the command again (which mints a new one and retires the old one). It expires
+after 14 days and stops working the moment it is used.
+
+On a **new** account the generated password is internal and never printed. On an
+account that already has a password, `--invite` mints the link without changing
+that password — a re-minted expired link cannot sign somebody out. The claim
+form writes the chosen password to the central login **and** to the W.A.Y and
+Laoka rows, so the phone's μlogger credential changes with it; `/change-password`
+does the same.
+
+Locally the same command is `npm run user -- set maxx --admin`. The CSV
+importer always processes `users.csv` first, because
+`transactions.added_by_user_id` has to point at the row that file creates.
 
 Every CSV import runs the schema migrator first, so a fresh `data/` directory
 works in one command. Stop the container while importing (SQLite handles

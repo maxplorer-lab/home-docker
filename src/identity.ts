@@ -121,7 +121,7 @@ function toHex(buf: ArrayBuffer | Uint8Array): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
-async function wayHashPassword(password: string): Promise<string> {
+export async function wayHashPassword(password: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16))
   const keyMaterial = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits'])
   const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: WAY_PBKDF2_ITERATIONS, hash: 'SHA-256' }, keyMaterial, 256)
@@ -288,6 +288,109 @@ export async function destroyHomeSession(db: D1Database, token: string | undefin
   if (!token) return
   const hash = await sha256Hex(token)
   await db.prepare('DELETE FROM sessions WHERE token_hash = ?1').bind(hash).run()
+}
+
+// ── First sign-in invites ───────────────────────────────────────
+// A CSV or SQL import brings history, not a password. An admin can create the
+// person with a one-time link instead of choosing a password FOR them: the row
+// already exists (so history and module accounts keep its identity), and the
+// person picks their own password at /claim.
+//
+// Only the SHA-256 of the token is stored, exactly like a session token, so
+// the database never holds a usable link. One open link per person, because
+// "which link do I send?" should have one answer.
+
+export const INVITE_DAYS = 14
+
+export interface InviteInfo {
+  user_id: string
+  username: string
+  display_name: string | null
+  expires_at: string
+}
+
+/** Mint a first-sign-in link for a person, replacing any still-open one. The
+ * raw token is returned once; only its hash is stored. */
+export async function createInvite(env: Env, userId: string, days = INVITE_DAYS): Promise<string> {
+  if (!pepperConfigured(env)) throw new Error('AUTH_PEPPER is not configured on this Worker.')
+  const token = randomTokenB64url()
+  const hash = await sha256Hex(token)
+  await env.HOME_DB.prepare('DELETE FROM invites WHERE user_id = ?1 AND used_at IS NULL').bind(userId).run()
+  await env.HOME_DB
+    .prepare("INSERT INTO invites (token_hash, user_id, expires_at) VALUES (?1, ?2, datetime('now', ?3))")
+    .bind(hash, userId, '+' + Math.max(1, Math.trunc(days)) + ' days')
+    .run()
+  return token
+}
+
+/** The person a link belongs to, or null when it is unknown, used or expired. */
+export async function resolveInvite(env: Env, token: string | undefined | null): Promise<InviteInfo | null> {
+  if (!token) return null
+  try {
+    const hash = await sha256Hex(token)
+    return await env.HOME_DB
+      .prepare(
+        `SELECT i.user_id, u.username, u.display_name, i.expires_at
+         FROM invites i JOIN users u ON u.id = i.user_id
+         WHERE i.token_hash = ?1 AND i.used_at IS NULL
+           AND i.expires_at > datetime('now') AND u.is_active = 1`
+      )
+      .bind(hash)
+      .first<InviteInfo>()
+  } catch {
+    // An imported database from before migrations-home/0007 has no table yet.
+    return null
+  }
+}
+
+/** Burn a link. Atomic, so two submissions of the same link cannot both win. */
+export async function consumeInvite(env: Env, token: string): Promise<boolean> {
+  try {
+    const hash = await sha256Hex(token)
+    const res = await env.HOME_DB
+      .prepare(
+        "UPDATE invites SET used_at = datetime('now') WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > datetime('now')"
+      )
+      .bind(hash)
+      .run()
+    return (res.meta?.changes ?? 0) > 0
+  } catch {
+    return false
+  }
+}
+
+/** Carry a changed password into the module rows that keep their OWN copy.
+ * W.A.Y's hash is also the μlogger phone credential, so a password that only
+ * reaches the central login leaves the browser working and the phone silently
+ * refused. Sompitra authenticates through its session table and has no
+ * password to update. Best-effort: a missing module row must never fail the
+ * password change itself. */
+export async function syncModulePasswords(
+  env: Env,
+  user: Pick<HomeUser, 'username'>,
+  password: string,
+): Promise<void> {
+  try {
+    const hash = await wayHashPassword(password)
+    await env.WAY_DB
+      .prepare('UPDATE way_users SET password_hash = ?1 WHERE lower(username) = lower(?2)')
+      .bind(hash, user.username)
+      .run()
+  } catch {
+    // No way-db, or no such person there.
+  }
+  try {
+    if (!pepperConfigured(env)) return
+    const hashed = await hashPassword(env, password)
+    await env.LAOKA_DB
+      .prepare(
+        'UPDATE laoka_users SET password_hash = ?1, password_salt = ?2, password_iterations = ?3 WHERE lower(username) = lower(?4)'
+      )
+      .bind(hashed.hash, hashed.salt, hashed.iterations, user.username)
+      .run()
+  } catch {
+    // No laoka-db, or no such person there.
+  }
 }
 
 // ── Module provisioning (find-or-create, idempotent) ─────────────

@@ -7,6 +7,7 @@
     "migrate:sqlite": "node server/migrate.mjs",
     "import:sql": "node server/import.mjs sql",
     "import:csv": "node server/import.mjs csv",
+    "user": "tsx server/users.mjs",
     "dev": "wrangler dev --port 8787",
     "deploy": "wrangler deploy",
     "db:local": "node scripts/db-migrate.mjs --local",

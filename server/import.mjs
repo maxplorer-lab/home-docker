@@ -267,11 +267,17 @@ function makeResolvers(raw, stats) {
   const categoryByName = new Map()
   const accountByName = new Map()
   const userByName = new Map()
-  const fallbackUser = raw.prepare('SELECT id FROM users ORDER BY created_at LIMIT 1').get()
+  let fallbackUser = raw.prepare('SELECT id FROM users ORDER BY created_at LIMIT 1').get()
 
   const ensureUser = (value) => {
-    const name = String(value ?? '').trim()
-    if (!name) return fallbackUser?.id ?? null
+    let name = String(value ?? '').trim()
+    // A ledger row may carry no person at all. Attribution is NOT NULL in the
+    // schema, so fall back to any existing user, or to one placeholder that
+    // makes the missing name visible instead of failing the whole file.
+    if (!name) {
+      if (fallbackUser?.id) return fallbackUser.id
+      name = 'Imported'
+    }
     const key = name.toLowerCase()
     if (userByName.has(key)) return userByName.get(key)
     let row = raw
@@ -283,6 +289,7 @@ function makeResolvers(raw, stats) {
         .run(id, name, name, 'IMPORTED')
       row = { id }
       stats.users += 1
+      if (!fallbackUser) fallbackUser = { id }
     }
     userByName.set(key, row.id)
     return row.id
@@ -330,9 +337,16 @@ function makeResolvers(raw, stats) {
   const ensureAccount = (nameValue, userId) => {
     const name = String(nameValue ?? '').trim()
     if (!name) return null
-    const key = name.toLowerCase()
+    const owner = userId || null
+    // The seed gives each person their own Salary/Sales account, so a name
+    // alone is ambiguous: prefer the account owned by the person the row is
+    // attributed to, and only then fall back to any account with that name.
+    const key = (owner ? String(owner) + '::' : '') + name.toLowerCase()
     if (accountByName.has(key)) return accountByName.get(key)
-    let row = raw.prepare('SELECT id FROM income_accounts WHERE lower(name) = lower(?) LIMIT 1').get(name)
+    let row = owner
+      ? raw.prepare('SELECT id FROM income_accounts WHERE lower(name) = lower(?) AND user_id = ? LIMIT 1').get(name, owner)
+      : null
+    if (!row) row = raw.prepare('SELECT id FROM income_accounts WHERE lower(name) = lower(?) ORDER BY user_id IS NULL, user_id LIMIT 1').get(name)
     if (!row) {
       const id = UUID()
       raw.prepare(
@@ -389,7 +403,9 @@ function importTransactions(raw, header, rows, options) {
 
       const rawType = String(pick(row, 'type', 'direction') ?? 'expense').trim().toLowerCase()
       const type = rawType === 'income' || rawType === 'in' || rawType === 'credit' ? 'income' : 'expense'
-      const amount = numeric(pick(row, 'amount', 'total', 'value', 'price'))
+      // `amount_mga` is what Sompitra's own report export calls the column
+      // ("Amount (MGA)"), so the household's real export imports as-is.
+      const amount = numeric(pick(row, 'amount', 'amount_mga', 'total', 'value', 'price'))
       if (!amount) {
         stats.skipped += 1
         continue
@@ -407,7 +423,10 @@ function importTransactions(raw, header, rows, options) {
         const direct = pick(row, 'income_account_id')
         accountId = direct
           ? String(direct)
-          : resolvers.ensureAccount(pick(row, 'income_account', 'income_account_name', 'account', 'account_name'), userId)
+          : resolvers.ensureAccount(
+              pick(row, 'income_account', 'income_account_name', 'account', 'account_name', 'income_source'),
+              userId,
+            )
       } else {
         const direct = pick(row, 'category_id')
         if (direct) {
@@ -472,7 +491,18 @@ function importTable(raw, table, header, rows, options) {
       return value === undefined ? null : value
     })
 
+  // A hand-made `users` export predates the merge, so it can lack the two
+  // columns this schema still requires: `pin_hash` is NOT NULL (the password
+  // lives in home.sqlite now) and `id` is what transactions point at.
+  const extras = []
+  if (table === 'users') {
+    if (!used.includes('pin_hash')) extras.push({ column: 'pin_hash', value: () => '' })
+    if (!used.includes('id')) extras.push({ column: 'id', value: () => UUID() })
+  }
+  const insertColumns = [...used, ...extras.map((extra) => extra.column)]
+
   let inserted = 0
+  let kept = 0
   let skipped = 0
   const work = () => {
     for (const row of rows) {
@@ -481,31 +511,44 @@ function importTable(raw, table, header, rows, options) {
         skipped += 1
         continue
       }
-      const insertColumns = used
-      const payload = mapped
-        .map((column, index) => (column ? values[index] : undefined))
-        .filter((v) => v !== undefined)
+      const payload = [
+        ...mapped.map((column, index) => (column ? values[index] : undefined)).filter((v) => v !== undefined),
+        ...extras.map((extra) => extra.value()),
+      ]
       if (options.dryRun) {
         inserted += 1
         continue
       }
+      // `users` is the one table where replacing an existing row is WRONG:
+      // its id is the key transactions, contracts and payments were made
+      // against, so a re-import must keep the row it finds.
+      const verb = table === 'users' ? 'INSERT OR IGNORE' : 'INSERT OR REPLACE'
       const placeholders = insertColumns.map(() => '?').join(', ')
-      raw.prepare(
-        `INSERT OR REPLACE INTO "${table.replace(/"/g, '""')}" (${insertColumns.map((c) => `"${c}"`).join(', ')}) ` +
+      const info = raw.prepare(
+        `${verb} INTO "${table.replace(/"/g, '""')}" (${insertColumns.map((c) => `"${c}"`).join(', ')}) ` +
         `VALUES (${placeholders})`
       ).run(...payload)
-      inserted += 1
+      if (info.changes === 0) kept += 1
+      else inserted += 1
     }
   }
 
   if (options.dryRun) work()
   else raw.transaction(work)()
 
-  return { inserted, skipped, columns: used }
+  return { inserted, skipped, kept, columns: used }
 }
 
-function importCsvFiles(files, options) {
-  if (files.length === 0) fail('no CSV files found')
+function importCsvFiles(inputFiles, options) {
+  if (inputFiles.length === 0) fail('no CSV files found')
+
+  // `users` FIRST, always. `transactions.added_by_user_id` points at a user
+  // row, and importing the people AFTER the ledger would leave every row
+  // attributed to a placeholder the users file then replaced.
+  const files = [...inputFiles].sort((a, b) => {
+    const rank = (file) => (tableFromFilename(file) === 'users' ? 0 : 1)
+    return rank(a) - rank(b) || a.localeCompare(b)
+  })
 
   // CSV import needs a schema to write into, so bring a fresh database up to
   // date first (a no-op when it already is).
@@ -520,6 +563,7 @@ function importCsvFiles(files, options) {
 
   let total = 0
   let skipped = 0
+  let createdUsers = 0
 
   try {
     for (const file of files) {
@@ -537,7 +581,10 @@ function importCsvFiles(files, options) {
       // `--table` optional for the common case (one CSV, exported by hand).
       if (!options.table) {
         const exists = raw.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
-        const looksLikeLedger = header.includes('date') && (header.includes('amount') || header.includes('total'))
+        // `amount_mga` is Sompitra's own report header ("Amount (MGA)"), and a
+        // report is exactly the export a household hands over.
+        const looksLikeLedger = header.includes('date') &&
+          (header.includes('amount') || header.includes('amount_mga') || header.includes('total'))
         if (!exists && looksLikeLedger) table = 'transactions'
       }
 
@@ -549,6 +596,7 @@ function importCsvFiles(files, options) {
         const stats = importTransactions(raw, header, records, options)
         total += stats.inserted
         skipped += stats.skipped
+        createdUsers += stats.users
         console.log(
           `[import] ${path.basename(file)} → transactions: ${stats.inserted} rows` +
           (stats.skipped ? `, ${stats.skipped} skipped (no date/amount)` : '') +
@@ -562,7 +610,8 @@ function importCsvFiles(files, options) {
         total += result.inserted
         skipped += result.skipped
         console.log(`[import] ${path.basename(file)} → ${table}: ${result.inserted} rows` +
-          (result.skipped ? `, ${result.skipped} empty skipped` : ''))
+          (result.skipped ? `, ${result.skipped} empty skipped` : '') +
+          (result.kept ? `, ${result.kept} existing kept` : ''))
       }
     }
 
@@ -573,6 +622,13 @@ function importCsvFiles(files, options) {
     }
   } finally {
     raw.close()
+  }
+
+  if (createdUsers > 0 && !options.dryRun) {
+    console.warn(
+      `[import] ${createdUsers} name-only user row(s) were created for attribution; they have no login.\n` +
+      `[import] create the household accounts with: tsx server/users.mjs set <username> --admin`
+    )
   }
 
   console.log(`[import] done: ${total} rows${skipped ? `, ${skipped} skipped` : ''}`)

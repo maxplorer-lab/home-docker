@@ -11,7 +11,9 @@ import {
   getHomeUserFromCookie, setHomePassword, createHomeUser,
   mintModuleCookies, pepperConfigured, tooManyAttempts, noteAttempt, clearAttempts,
   sha256Hex, validPassword,
+  resolveInvite, consumeInvite, syncModulePasswords,
 } from '../identity'
+import type { InviteInfo } from '../identity'
 import { isSecureRequest, clearCookieValue } from '../lib/cookies'
 import type { Env } from '../env'
 
@@ -300,6 +302,92 @@ auth.get('/logout', async (c) => {
   return c.redirect('/login')
 })
 
+// ─── First sign-in links ────────────────────────────────────
+// A household that imported its history (a CSV or a D1 dump) has the people
+// but not their passwords. An admin mints a one-time link instead of choosing
+// a password FOR them; /claim is where they choose it. Same shell as the rest
+// of the front door, and the same one-time-link shape as /bootstrap: whoever
+// holds the link sets the password, and the link then stops working.
+function claimScreen(invite: InviteInfo, token: string, error?: string) {
+  const name = invite.display_name || invite.username
+  return (
+    <AuthShell title="Choose a password" heading={`Welcome, ${name}`}
+      blurb="Pick the password you will use for Home and Sompitra. You can change it later in Settings.">
+      <form method="post" action="/claim" class="space-y-4"
+        onsubmit="if (this.password.value !== this.confirm.value) { alert('The two new passwords do not match.'); return false } return true">
+        {error && <AuthAlert tone="bad" message={error} />}
+        <input type="hidden" name="token" value={token} />
+        <Field label="New password (min 8)" name="password" type="password" autocomplete="new-password" minlength={8} required />
+        <Field label="Confirm new password" name="confirm" type="password" autocomplete="new-password" minlength={8} required />
+        <AuthButton>Save and sign in</AuthButton>
+      </form>
+    </AuthShell>
+  )
+}
+
+const linkEnded = (
+  <AuthShell title="Set your password" heading="That link has ended"
+    blurb="First sign-in links are one-time, and they expire after two weeks.">
+    <p class="text-[13px] leading-snug" style={{ color: 'var(--ink-2)' }}>
+      Ask an admin for a fresh link, then open it here.
+    </p>
+    <p class="mt-4 text-center">
+      <a href="/login" class="t-micro underline decoration-dotted">Back to sign in</a>
+    </p>
+  </AuthShell>
+)
+
+// ─── GET /claim?token=… ──────────────────────────────────────
+auth.get('/claim', async (c) => {
+  const token = String(c.req.query('token') || '').trim()
+  const invite = await resolveInvite(c.env, token)
+  if (!invite) return c.html(linkEnded)
+  return c.html(claimScreen(invite, token))
+})
+
+// ─── POST /claim ─────────────────────────────────────────────
+auth.post('/claim', async (c) => {
+  const body = await c.req.parseBody()
+  const token = String(body.token || '')
+  const password = String(body.password || '')
+  const confirm = String(body.confirm || '')
+
+  // Resolve BEFORE burning the link: a mistyped confirmation must not cost the
+  // person their one-time link and a second trip to the admin.
+  const invite = await resolveInvite(c.env, token)
+  if (!invite) return c.redirect('/claim')
+  if (!validPassword(password)) return c.html(claimScreen(invite, token, 'Use at least 8 characters.'))
+  if (password !== confirm) return c.html(claimScreen(invite, token, 'The two new passwords do not match.'))
+
+  if (!(await consumeInvite(c.env, token))) return c.redirect('/claim')
+
+  const set = await setHomePassword(c.env, invite.user_id, password)
+  if (!set.ok) return c.redirect('/login?err=weak')
+
+  const user = await findHomeUserByName(c.env.HOME_DB, invite.username)
+  if (!user) return c.redirect('/login')
+
+  // The password has to reach the module rows too: W.A.Y's hash IS the phone's
+  // μlogger credential, so a central-only change leaves the browser working
+  // and the phone silently refused.
+  await syncModulePasswords(c.env, user, password)
+
+  await c.env.HOME_DB.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?1").bind(user.id).run().catch(() => {})
+
+  const secure = isSecureRequest(c.req.url)
+  const session = await createHomeSession(c.env.HOME_DB, user.id)
+  setCookie(c, HOME_COOKIE, session, { path: '/', httpOnly: true, sameSite: 'Lax', secure, maxAge: MAX_AGE_HOME })
+
+  // Module cookies are a convenience: a module repairs itself on its first
+  // 401 from the central session anyway (rule 42).
+  try {
+    const cookies = await mintModuleCookies(c.env, user, secure, password)
+    for (const cookie of cookies) c.header('Set-Cookie', cookie.value, { append: true })
+  } catch { /* repair path covers it */ }
+
+  return c.redirect('/')
+})
+
 // ─── GET /change-password ────────────────────────────────────
 auth.get('/change-password', (c) => {
   const err = c.req.query('err')
@@ -343,6 +431,9 @@ auth.post('/change-password', async (c) => {
 
   const res = await setHomePassword(c.env, user.id, next)
   if (!res.ok) return c.redirect('/change-password?err=weak')
+
+  // Same reason as /claim: the phone authenticates with the module copy.
+  await syncModulePasswords(c.env, user, next)
 
   return c.redirect('/change-password?ok=1')
 })

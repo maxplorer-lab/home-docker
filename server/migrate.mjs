@@ -229,6 +229,21 @@ function ensureWayColumns(db) {
   }
 }
 
+/** First sign-in links live in `invites` (migrations-home/0007). An IMPORTED
+ *  dump has every migration stamped as applied WITHOUT running it, so a
+ *  schema from before that table stays usable by creating it here — the same
+ *  reason ensureWayColumns exists. Idempotent. */
+function ensureHomeInvites(db) {
+  if (tableNames(db).includes('invites')) return
+  const file = path.join(HOME_MIGRATIONS, '0007_invites.sql')
+  if (!fs.existsSync(file)) return
+  try {
+    db.exec(fs.readFileSync(file, 'utf8'))
+  } catch (err) {
+    console.warn(`[home] could not create the invites table: ${err.message}`)
+  }
+}
+
 /** 0002_settings.sql drops `devices`, but `messages.device_id` still references
  *  it — and D1/SQLite resolves the FK parent at write time, so without the
  *  repair EVERY message insert fails (AGENTS.md rule 19). Idempotent. */
@@ -264,6 +279,7 @@ export function migrateAll({ quiet = false } = {}) {
       quiet,
     })
     ensureWayColumns(home)
+    ensureHomeInvites(home)
     repairWayMessagesFk(home)
     const sompitraResult = migrateDatabase(sompitra, SOMPITRA_MIGRATIONS, {
       sentinel: 'transactions',
