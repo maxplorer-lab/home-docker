@@ -1,6 +1,6 @@
 node_modules/
 .wrangler/
-data/
+/data/
 .dev.vars
 .env
 worker-configuration.d.ts

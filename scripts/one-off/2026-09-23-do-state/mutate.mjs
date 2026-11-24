@@ -44,7 +44,12 @@ function writeKeepingEol(p, text) {
 // ── extract smoke §25 out of the shipping suite ────────────────────────────
 const smoke = normalized('scripts/smoke.mjs')
 const start = smoke.indexOf('// ─── 25. no request data parked on a DO')
-const end = smoke.indexOf('// ─── summary')
+// The section ends at the NEXT banner, not at the summary. Later sections use
+// the live harness (`body`, `req`), so slicing to `// ─── summary` pulled them
+// into the extraction and failed with `body is not defined` before any
+// mutation ran.
+const nextBanner = start === -1 ? -1 : smoke.indexOf('\n// ─── ', start + 16)
+const end = nextBanner === -1 ? smoke.indexOf('// ─── summary') : nextBanner
 if (start === -1 || end === -1) {
   console.error('could not find section 25 in scripts/smoke.mjs')
   process.exit(2)
