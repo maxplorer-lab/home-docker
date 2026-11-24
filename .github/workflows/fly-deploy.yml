@@ -2,7 +2,7 @@ name: Deploy to Fly.io
 
 # Manual on purpose: this app is single-writer SQLite + one always-on machine,
 # so a deploy is a deliberate act, not a side effect of a commit. Set the
-# FLY_API_TOKEN secret first (`fly tokens create deploy -a home-sompitra`),
+# FLY_API_TOKEN secret first (`fly tokens create deploy -a home-superapp`),
 # then run this workflow from the Actions tab.
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
       - name: Require FLY_API_TOKEN
         run: |
           if [ -z "$FLY_API_TOKEN" ]; then
-            echo "::error::Add a repository secret named FLY_API_TOKEN (fly tokens create deploy -a home-sompitra)."
+            echo "::error::Add a repository secret named FLY_API_TOKEN (fly tokens create deploy -a home-superapp)."
             exit 1
           fi
         env:
