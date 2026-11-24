@@ -1,0 +1,58 @@
+# ─── Fly.io ──────────────────────────────────────────────────────
+# One machine, one volume, no auto-stop. The reasons are in DOCKER.md:
+#   * SQLite plus the in-process WebSocket hub is single-writer, so the app
+#     must not scale to two machines;
+#   * a suspended machine cold-starts on the first μlogger upload, and the
+#     phone's HTTP timeout is short enough to lose that fix;
+#   * /data is the only durable place — the container's own filesystem is
+#     replaced on every deploy.
+#
+# Sized for Fly's Free plan (a $5/month usage allowance), which is why the VM
+# is 256 MB: the built image measures ~82 MB RSS after boot and ~83 MB after
+# 100 requests (DOCKER.md → Cost). At 256 MB this app is ~$3.01/month in jnb,
+# leaving ~$2 of headroom; at 512 MB it is ~$4.96, and a 31-day month or a
+# burst of traffic crosses the allowance — which bills the WHOLE month at
+# standard rates instead of just the excess. Set a billing alert in the
+# dashboard, and only raise this value after measuring (fly machine status).
+#
+# Create the volume once, in the same region:
+#   fly volumes create home_data --region jnb --size 1
+# Set the secrets once:
+#   fly secrets set AUTH_PEPPER=... SESSION_SECRET=...
+# Then deploy ONE machine — flyctl creates two for a new app by default:
+#   fly deploy --ha=false
+#   fly machine list          # must print exactly one machine
+
+app = "home-sompitra"
+primary_region = "jnb"          # Johannesburg — closest to Madagascar
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  DATA_DIR = "/data"
+  TZ = "Africa/Nairobi"
+
+[mounts]
+  source = "home_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "15s"
+  method = "GET"
+  path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

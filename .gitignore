@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+data/
+.dev.vars
+.env
+worker-configuration.d.ts
+*.log
+.DS_Store
+.freebuff/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

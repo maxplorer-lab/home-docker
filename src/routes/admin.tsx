@@ -1,0 +1,740 @@
+/** @jsxImportSource hono/jsx */
+import { Hono } from 'hono'
+import type { Context } from 'hono'
+import { getCookie } from 'hono/cookie'
+import { Layout, Card } from '../views/layout'
+import { requireAuth } from '../lib/middleware'
+import {
+  listHomeUsers, createHomeUser, setHomePassword,
+  ensureModuleAccounts, getHomeUserFromCookie,
+} from '../identity'
+import type { Env, User } from '../db/schema'
+import type { HomeUser } from '../identity'
+import { readDiag } from '../lib/diagnostics'
+import {
+  createShare, listShares, revokeShare, revokeAllShares, replaceOpenShares, timeUntil,
+  shareErrorText, listShareTargets, WAY_SHARE_KIND,
+} from '../lib/share'
+
+/** The pin from the create that just happened, so it can be shown ONCE. */
+interface NewSharePin {
+  pin: string
+  label: string
+  device: string
+  expiresAt: string
+  /** "in 4 h 32 min" — the cost of a 23:50 code, visible while it still matters. */
+  expiresIn: string
+}
+
+const admin = new Hono<{ Bindings: Env; Variables: { user: User } }>()
+admin.use('*', requireAuth)
+
+/** Gate: only people whose CENTRAL account is an admin get in. The central
+ * role is the source of truth — module rows are just provisions. */
+async function requireCentralAdmin(c: Context<any>): Promise<HomeUser | null> {
+  const homeUser = await getHomeUserFromCookie(c.env.HOME_DB, getCookie(c, 'home_session'))
+  return homeUser && homeUser.role === 'admin' ? homeUser : null
+}
+
+function errMessage(code: string): string {
+  switch (code) {
+    case 'bad_username': return 'Usernames are 3 to 24 characters: letters, numbers, dot, dash or underscore.'
+    case 'bad_password': return 'Passwords must be at least 8 characters.'
+    case 'taken': return 'That username is already taken.'
+    case 'no_pepper': return 'AUTH_PEPPER is not configured on this Worker.'
+    case 'bad_target': return 'User not found.'
+    // The share reasons come from lib/share.ts, so the console and the map's own
+    // settings row say the same sentence about the same failure.
+    case 'no_subject':
+    case 'no_label':
+    case 'no_table':
+    case 'db_error': return shareErrorText(code)
+    case 'share_failed': return 'Could not create that live code — check that a W.A.Y device is selected and AUTH_PEPPER is set.'
+    default: return 'Something went wrong.'
+  }
+}
+
+// ─── GET /admin ─────────────────────────────────────────────
+admin.get('/', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+  return renderAdmin(c, { err: c.req.query('err'), ok: c.req.query('ok') })
+})
+
+/**
+ * The console, rendered from every path into it — including the POST that mints
+ * a live-share pin, which is why this takes an option at all: the pin is shown
+ * in the RESPONSE to the create and never in a redirect URL, because a pin in
+ * an address bar is a pin in a browser history file and in an access log.
+ */
+async function renderAdmin(
+  c: Context<any>,
+  opts: { err?: string; ok?: string; newPin?: NewSharePin } = {}
+) {
+  const user = c.get('user')
+  const users = await listHomeUsers(c.env.HOME_DB)
+
+  // Per-module account status, so the admin can see provisioning at a glance.
+  const rows = await Promise.all(users.map(async (u) => {
+    const [sompitra, way, laoka] = await Promise.all([
+      c.env.DB.prepare('SELECT id FROM users WHERE lower(username) = lower(?1)').bind(u.username).first().catch(() => null),
+      c.env.WAY_DB.prepare('SELECT id FROM way_users WHERE lower(username) = lower(?1)').bind(u.username).first().catch(() => null),
+      c.env.LAOKA_DB.prepare('SELECT id FROM laoka_users WHERE lower(username) = lower(?1)').bind(u.username).first().catch(() => null),
+    ])
+    return { u, sompitra: !!sompitra, way: !!way, laoka: !!laoka }
+  }))
+
+  const err = opts.err
+  const ok = opts.ok
+  const newPin = opts.newPin
+  // WHO can be shared, from the ONE authority both doors use: `listShareTargets`
+  // (lib/share.ts) joins W.A.Y's `devices` to the accounts, so a leftover device
+  // row with no account cannot be offered here and then refused by the mint. This
+  // is the one place the console reads module data, and it reads it to OFFER it,
+  // not to change it (project.md, "Databases"). A way-db without accounts still
+  // renders the console — the list simply comes back empty.
+  const devices = await listShareTargets(c.env)
+  const shares = await listShares(c.env, 'active')
+  // What ENDED, newest first: a revoked code is a fact worth keeping, and
+  // "did I already revoke that one?" is the question this answers.
+  const ended = (await listShares(c.env, 'ended')).slice(0, 5)
+  const shareLink = newPin ? `${new URL(c.req.url).origin}/live#${newPin.pin}` : null
+
+  return c.html(
+    <Layout title="Admin" user={user}>
+      <div class="max-w-lg mx-auto">
+        <div class="flex items-baseline justify-between mb-5">
+          <h2 class="text-xl font-bold">👥 People & Access</h2>
+          <a href="/admin/diagnostics" class="text-sm text-blue-600 dark:text-blue-400 hover:underline">🩺 Diagnostics</a>
+        </div>
+
+        {ok && <p class="mb-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl text-sm text-green-700 dark:text-green-400">✅ Saved</p>}
+        {err && <p class="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl text-sm text-red-600 dark:text-red-400">{errMessage(err)}</p>}
+
+        {/* Add a person */}
+        <Card title="➕ Add a person" className="mb-4">
+          <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+            Creates the ONE account: username + password. The account is provisioned
+            into Sompitra, W.A.Y and Laoka immediately — share the credentials and
+            the person can log in.
+          </p>
+          <form method="post" action="/admin/users" class="space-y-3">
+            <div class="grid grid-cols-2 gap-2">
+              <input type="text" name="username" required maxlength={24} placeholder="username (e.g. maxx)" autocapitalize="none" spellcheck={false}
+                class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+              <input type="text" name="display_name" maxlength={40} placeholder="Display name (e.g. MaxX)"
+                class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+            </div>
+            <input type="password" name="password" required minlength={8} placeholder="Password (min 8 characters)" autocomplete="new-password"
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+            <select name="role" class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500">
+              <option value="member">Member</option>
+              <option value="admin">Admin</option>
+            </select>
+            <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2.5 rounded-xl">Create account</button>
+          </form>
+        </Card>
+
+        {/* People list */}
+        <Card title="👥 Accounts" className="mb-4">
+          <div class="space-y-3">
+            {rows.map(({ u, sompitra, way, laoka }) => (
+              <details class="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl overflow-hidden">
+                <summary class="cursor-pointer px-3 py-2.5 flex items-center justify-between gap-2 select-none">
+                  <span class="flex items-center gap-2 min-w-0">
+                    <span class="text-lg">{u.role === 'admin' ? '👑' : '👤'}</span>
+                    <span class="min-w-0">
+                      <span class="block text-sm font-semibold truncate">{u.display_name || u.username}</span>
+                      <span class="block text-[11px] text-gray-400 truncate">{u.username}</span>
+                    </span>
+                  </span>
+                  <span class="flex items-center gap-1 shrink-0">
+                    <span title={`Sompitra ${sompitra ? '✓' : '—'}`} class={`text-[10px] px-1.5 py-0.5 rounded font-bold ${sompitra ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300' : 'bg-gray-100 text-gray-400 dark:bg-gray-700'}`}>💰</span>
+                    <span title={`W.A.Y ${way ? '✓' : '—'}`} class={`text-[10px] px-1.5 py-0.5 rounded font-bold ${way ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300' : 'bg-gray-100 text-gray-400 dark:bg-gray-700'}`}>📍</span>
+                    <span title={`Laoka ${laoka ? '✓' : '—'}`} class={`text-[10px] px-1.5 py-0.5 rounded font-bold ${laoka ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300' : 'bg-gray-100 text-gray-400 dark:bg-gray-700'}`}>🍲</span>
+                    {u.is_active !== 1 && <span class="text-[10px] px-1.5 py-0.5 rounded font-bold bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">off</span>}
+                  </span>
+                </summary>
+                <div class="px-3 pb-3 border-t border-gray-100 dark:border-gray-700 space-y-3 pt-3">
+                  {/* Reset password */}
+                  <form method="post" action={`/admin/users/${u.id}/password`} class="flex gap-2">
+                    <input type="password" name="password" required minlength={8} placeholder="New password (min 8)" autocomplete="new-password"
+                      class="flex-1 min-w-0 bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-green-500" />
+                    <button type="submit" class="px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold whitespace-nowrap">Reset</button>
+                  </form>
+                  {/* Activate / deactivate */}
+                  <form method="post" action={`/admin/users/${u.id}/toggle`}>
+                    <button type="submit" class={`w-full text-sm font-semibold py-2 rounded-xl ${u.is_active === 1
+                      ? 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40'
+                      : 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-900/40'}`}>
+                      {u.is_active === 1 ? '🚫 Deactivate (blocks sign-in everywhere)' : '✅ Reactivate'}
+                    </button>
+                  </form>
+                </div>
+              </details>
+            ))}
+          </div>
+        </Card>
+
+        {/* ─── Live share — the ONE page an outsider can open ─────── */}
+        <Card title="📍 Live share (W.A.Y)" className="mb-4">
+          <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+            A 6-digit code that lets somebody <b>outside</b> the household follow ONE
+            device on a map — live position and the whole of today's track — with no
+            account and nothing to install. It stops at the next <b>00:00&nbsp;UTC</b> and
+            cannot be extended. Admin-only, and the person being watched is not told:
+            the code records who created it, and every refused attempt appears in
+            Diagnostics.
+          </p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">
+            <b>Revoke</b> stops one code immediately; <b>Revoke all</b> ends every open
+            code at once — that is the button for "she has arrived". Both are instant:
+            the next thing the viewer's page does is say the link has ended.
+            <b>One code per person:</b> generating a new one for the same device replaces
+            whatever was open for it, so "who is being shared" always has one answer.
+          </p>
+
+          {newPin && (
+            <div class="mb-4 rounded-xl border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20 p-3">
+              <p class="text-xs font-semibold text-green-700 dark:text-green-400 mb-2">
+                Code for {newPin.label} — shown ONCE, now. It is stored hashed, so it cannot be
+                displayed again; generate a new one if it is lost.
+              </p>
+              <p class="font-mono text-3xl font-bold tracking-[.3em] text-center text-green-700 dark:text-green-400 mb-2" id="share-pin">{newPin.pin}</p>
+              <div class="flex gap-2">
+                <input id="share-link" readonly value={shareLink ?? ''} spellcheck={false}
+                  class="flex-1 min-w-0 bg-white dark:bg-gray-900 border border-green-200 dark:border-green-800 rounded-xl px-3 py-2 text-xs font-mono focus:outline-none" />
+                <button type="button" id="share-copy" class="px-3 py-2 rounded-xl bg-green-600 hover:bg-green-700 text-white text-xs font-semibold whitespace-nowrap">Copy link</button>
+              </div>
+              <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-2">
+                Send that link, or just read out the six digits — the page asks for the code either way.
+                Ends {newPin.expiresAt} UTC ({newPin.expiresIn}).
+              </p>
+              <script dangerouslySetInnerHTML={{ __html: SHARE_COPY_JS }} />
+            </div>
+          )}
+
+          <form method="post" action="/admin/share" class="space-y-3">
+            <select name="device" required
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500">
+              {devices.length === 0
+                ? <option value="">No shareable people yet</option>
+                : devices.map((d) => <option value={d.deviceId}>{d.name} ({d.deviceId})</option>)}
+            </select>
+            {/* No free-text label: the viewer's page shows the NAME of the device
+                the code resolves to. A text box here could only ever disagree with
+                the map underneath it. */}
+            <p class="text-[11px] text-gray-500 dark:text-gray-400">
+              The viewer sees <b>that person's own name</b>, taken from the device the code
+              points at — there is nothing to type.
+            </p>
+            <button type="submit" disabled={devices.length === 0}
+              class="w-full bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white font-semibold py-2.5 rounded-xl">
+              🔗 Generate a live code
+            </button>
+          </form>
+
+          {shares.length > 0 && (
+            <div class="mt-4 space-y-2">
+              <div class="flex items-center justify-between gap-2">
+                <p class="text-xs font-semibold text-gray-500 dark:text-gray-400">
+                  Active codes ({shares.length})
+                </p>
+                {shares.length > 1 && (
+                  <form method="post" action="/admin/share/revoke-all">
+                    <button type="submit" class="px-3 py-1.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-[11px] font-semibold whitespace-nowrap">
+                      Revoke all
+                    </button>
+                  </form>
+                )}
+              </div>
+              {shares.map((s) => (
+                <div class="flex items-center justify-between gap-2 bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl px-3 py-2">
+                  <span class="min-w-0">
+                    <span class="block text-sm font-semibold truncate">{s.label} · {s.subject}</span>
+                    <span class="block text-[11px] text-gray-400">
+                      ends {s.expires_at.replace('T', ' ').slice(0, 16)} UTC ({timeUntil(s.expires_at)}) · by {s.created_by}
+                      {s.last_used_at ? ` · opened ${s.last_used_at.replace('T', ' ').slice(0, 16)}` : ' · not opened yet'}
+                    </span>
+                  </span>
+                  <form method="post" action={`/admin/share/${s.id}/revoke`}>
+                    <button type="submit" class="px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 text-xs font-semibold whitespace-nowrap">Revoke</button>
+                  </form>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {ended.length > 0 && (
+            <div class="mt-4 space-y-1.5">
+              <p class="text-xs font-semibold text-gray-500 dark:text-gray-400">
+                Ended codes
+              </p>
+              {ended.map((s) => (
+                <div class="flex items-baseline justify-between gap-2 bg-gray-50 dark:bg-gray-800/60 border border-gray-100 dark:border-gray-700 rounded-xl px-3 py-2">
+                  <span class="min-w-0">
+                    <span class="block text-xs font-semibold text-gray-500 dark:text-gray-400 truncate">
+                      {s.label} · {s.subject}
+                    </span>
+                    <span class="block text-[11px] text-gray-400">
+                      {s.state === 'revoked'
+                        ? `revoked ${(s.revoked_at ?? '').replace('T', ' ').slice(0, 16)} UTC`
+                        : `expired ${s.expires_at.replace('T', ' ').slice(0, 16)} UTC`}
+                      {' · by '}{s.created_by}
+                      {s.last_used_at ? ` · last watched ${s.last_used_at.replace('T', ' ').slice(0, 16)} UTC` : ''}
+                    </span>
+                  </span>
+                  <span class="text-[11px] text-gray-400 whitespace-nowrap">{s.state}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <p class="text-[11px] text-gray-400 text-center">
+          Deactivating blocks the central login; module accounts are kept for their data.
+          Resetting a password does NOT end existing sessions — sign them out by changing the password
+          and having devices log in again.
+        </p>
+      </div>
+    </Layout>
+  )
+}
+
+/** Copy-to-clipboard for the one-tap link, with a select-and-copy fallback for
+ *  the browsers that refuse `clipboard` outside a secure context (a phone on a
+ *  plain-http LAN is exactly that case, and it is where this gets used). */
+const SHARE_COPY_JS = `
+(function(){
+  var b = document.getElementById('share-copy'), f = document.getElementById('share-link');
+  if (!b || !f) return;
+  b.addEventListener('click', function(){
+    f.select();
+    var done = function(){ b.textContent = 'Copied'; setTimeout(function(){ b.textContent = 'Copy link'; }, 1500); };
+    if (navigator.clipboard) { navigator.clipboard.writeText(f.value).then(done, done); }
+    else { try { document.execCommand('copy'); } catch (e) {} done(); }
+  });
+})();
+`
+
+// ─── POST /admin/share (mint a live code) ───────────────────
+admin.post('/share', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+
+  const body = await c.req.parseBody()
+  const device = String(body.device || '').trim()
+  // Any `label` a hand-made form posts is ignored: the name on the viewer's page
+  // is read from the subject, and that decision lives in `createShare`.
+
+  const created = await createShare(c.env, {
+    kind: WAY_SHARE_KIND, subject: device, createdBy: gate.username,
+  })
+  // The reason travels in the code, not flattened into one word: a missing
+  // migration and an unset AUTH_PEPPER are different problems with different
+  // fixes, and `errMessage` above already knows how to say each one.
+  if (!created.ok) return c.redirect(`/admin?err=${encodeURIComponent(created.error)}`)
+  // ONE code per person: the new grant replaces whatever was open for this
+  // device, so an older code cannot keep showing a map the admin no longer means
+  // to share. Done after the create, so a failed mint revokes nothing.
+  await replaceOpenShares(c.env, device, created.share.id)
+
+  // Rendered, not redirected: the pin is in the response body and never in a URL.
+  return renderAdmin(c, { newPin: {
+    pin: created.pin, label: created.share.label, device: created.share.subject,
+    expiresAt: created.share.expires_at.replace('T', ' ').slice(0, 16),
+    expiresIn: timeUntil(created.share.expires_at),
+  } })
+})
+
+// ─── POST /admin/share/:id/revoke ───────────────────────────
+admin.post('/share/:id/revoke', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+  const id = Number(c.req.param('id'))
+  if (Number.isFinite(id)) await revokeShare(c.env, id)
+  return c.redirect('/admin?ok=1')
+})
+
+// ─── POST /admin/share/revoke-all ───────────────────────────
+// "She has arrived — stop sharing." Registered as its own literal path (not a
+// `:id`), so the per-grant route above can never swallow it. Idempotent: with
+// nothing open it does nothing and still lands back on the console.
+admin.post('/share/revoke-all', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+  await revokeAllShares(c.env)
+  return c.redirect('/admin?ok=1')
+})
+
+// ─── POST /admin/users (create) ─────────────────────────────
+admin.post('/users', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+
+  const body = await c.req.parseBody()
+  const username = String(body.username || '').trim()
+  const displayName = String(body.display_name || '').trim()
+  const password = String(body.password || '')
+  const role = String(body.role || 'member') === 'admin' ? 'admin' as const : 'member' as const
+
+  const res = await createHomeUser(c.env, { username, password, displayName, role })
+  if (!res.ok) {
+    const code = /3 to 24/.test(res.error) ? 'bad_username' : /8 characters/.test(res.error) ? 'bad_password' : /taken/.test(res.error) ? 'taken' : 'no_pepper'
+    return c.redirect(`/admin?err=${code}`)
+  }
+
+  // Provision into every module right away (best-effort) so the person's
+  // accounts exist before their first login.
+  try { await ensureModuleAccounts(c.env, res.user, password) } catch { /* repair path covers it */ }
+
+  return c.redirect('/admin?ok=1')
+})
+
+// ─── POST /admin/users/:id/password (reset) ─────────────────
+admin.post('/users/:id/password', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+
+  const body = await c.req.parseBody()
+  const password = String(body.password || '')
+  if (!/^\S{8,200}$/.test(password)) return c.redirect('/admin?err=bad_password')
+
+  const res = await setHomePassword(c.env, c.req.param('id'), password)
+  if (!res.ok) return c.redirect('/admin?err=bad_password')
+  return c.redirect('/admin?ok=1')
+})
+
+// ─── POST /admin/users/:id/toggle (activate / deactivate) ───
+admin.post('/users/:id/toggle', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+
+  const id = c.req.param('id')
+  const row = await c.env.HOME_DB.prepare('SELECT is_active FROM users WHERE id = ?1').bind(id).first<{ is_active: number }>()
+  if (!row) return c.redirect('/admin?err=bad_target')
+
+  await c.env.HOME_DB.prepare('UPDATE users SET is_active = ?1 WHERE id = ?2')
+    .bind(row.is_active === 1 ? 0 : 1, id).run()
+  return c.redirect('/admin?ok=1')
+})
+
+// ─── Diagnostics ─────────────────────────────────────────────
+// GET /admin/diagnostics       → the page
+// GET /admin/diagnostics.json  → the same facts, machine-readable
+//
+// WHY this exists (the long version is in src/lib/diagnostics.ts and in
+// FleetDO.countGate): every module is built to fail SILENTLY wherever failing
+// loudly would land on a person. µlogger must never see an upload error, and a
+// push must never break the action that triggered it. Both are right, and the
+// price is that "silently fine" and "silently broken" look identical from
+// outside — which is exactly what made a real-world test of the tracking rules
+// impossible to read, and it is the one class of fact no module was storing.
+//
+// This surface is deliberately HOME-wide, not a W.A.Y back door. It reads the
+// same ledger every module writes to: money and Kiné notifications refuse or
+// skip into home-db's diag_events, tracking gates count themselves in the
+// FleetDO's own SQLite (they are far too frequent for D1), and module health
+// probes every module's data — which lives in TWO databases since the four
+// originals were merged on 2026-10-06 (see wrangler.jsonc).
+
+interface ModuleHealth { name: string; ok: boolean; detail: string; ms: number }
+
+async function probe(db: D1Database | undefined, name: string, sql: string): Promise<ModuleHealth> {
+  const t0 = Date.now()
+  if (!db) return { name, ok: false, detail: 'binding is missing', ms: 0 }
+  try {
+    const row = await db.prepare(sql).first<Record<string, unknown>>()
+    const detail = row
+      ? Object.entries(row).map(([k, v]) => `${k}=${v ?? '—'}`).join('  ')
+      : 'answered, but with no rows'
+    return { name, ok: true, detail, ms: Date.now() - t0 }
+  } catch (e) {
+    return { name, ok: false, detail: e instanceof Error ? e.message : String(e), ms: Date.now() - t0 }
+  }
+}
+
+interface IngestGate { gate: string; n: number; firstAt: string; lastAt: string }
+interface IngestDrop { at: string; deviceId: string | null; gate: string; detail: string }
+
+/**
+ * The gates in the order a ping meets them — and the persistence branches last,
+ * in the order the two equations below name them, so the grid and the sums read
+ * left to right in the same order. (That is why `unwitnessed` sits after
+ * `collapsed` here although the intake meets it earlier: it is a branch of the
+ * persistence decision to the reader, and `drawn + collapsed + unwitnessed +
+ * paused` is how the sum is spelled.)
+ *
+ * The list is exhaustive on purpose and it INCLUDES the gates that never fired.
+ * The DO only stores gates it has counted, so a fresh reading would otherwise
+ * omit `drawn` entirely — and "0 drawn" is the single most important number to
+ * see after a parked-phone test (it is the difference between "the phone was
+ * collapsed on purpose" and "nothing is being stored"). A missing row reads as
+ * "this gate does not exist", which is why `npm run smoke` fails if the DO
+ * counts a gate this list does not render.
+ */
+const GATE_ORDER = [
+  'received', 'accuracy', 'report-unbelievable', 'glitch', 'accepted',
+  'drawn', 'collapsed', 'unwitnessed', 'paused',
+] as const
+
+/** Ask the FleetDO for its gate ledger. Returns null when the DO cannot be
+ *  reached, so the page can say so instead of showing zeroes that would read as
+ *  "nothing was ever dropped". */
+async function readIngest(env: Env): Promise<{
+  build: string | null; gates: IngestGate[]; drops: IngestDrop[]; error?: string
+} | null> {
+  if (!env.FLEET_DO) return null
+  try {
+    const id = env.FLEET_DO.idFromName('fleet')
+    const res = await env.FLEET_DO.get(id).fetch('https://fleet-do/debug-notify', { method: 'GET' })
+    if (res.status === 404) {
+      return { build: null, gates: [], drops: [], error: 'the running instance is running PRE-ledger code (no /debug-notify route)' }
+    }
+    const data = (await res.json()) as { build?: string; ingest?: { gates?: IngestGate[]; drops?: IngestDrop[] } }
+    return { build: data.build ?? null, gates: data.ingest?.gates ?? [], drops: data.ingest?.drops ?? [] }
+  } catch (e) {
+    return { build: null, gates: [], drops: [], error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+async function buildDiagnostics(c: Context<any>) {
+  const env = c.env as Env
+
+  // Module health: one cheap query each. The index probe is deliberately here
+  // rather than in a doc -- an unindexed gps_pings is the one schema fact that
+  // turns into a same-day outage as real data accumulates, so it belongs where
+  // somebody will actually see it.
+  const [home, sompitra, way, laoka, indexes] = await Promise.all([
+    probe(env.HOME_DB, 'home-db', 'SELECT (SELECT COUNT(*) FROM users) AS people, (SELECT COUNT(*) FROM diag_events) AS ledger'),
+    probe(env.DB, 'sompitra-db', 'SELECT COUNT(*) AS transactions FROM transactions'),
+    probe(env.WAY_DB, 'way (in home-db)', 'SELECT COUNT(*) AS pings FROM gps_pings'),
+    probe(env.LAOKA_DB, 'laoka (in sompitra-db)', 'SELECT COUNT(*) AS weeks FROM weeks'),
+    probe(env.WAY_DB, 'way indexes (in home-db)', "SELECT COUNT(*) AS on_pings FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('gps_pings', 'messages')"),
+  ])
+
+  const ingest = await readIngest(env)
+  const ledger = await readDiag(env, 40)
+
+  // The arithmetic that makes the ledger readable: a ping that arrived either
+  // died at a gate or reached the state machine, and one that reached it was
+  // either drawn, collapsed, unwitnessed or paused. A sum that does not hold
+  // means a gate exists that nobody is counting.
+  const rawGates = ingest?.gates ?? []
+  const gates: IngestGate[] = GATE_ORDER.map((name) => {
+    const hit = rawGates.find((g) => g.gate === name)
+    return hit ?? { gate: name, n: 0, firstAt: '', lastAt: '' }
+  }).concat(rawGates.filter((g) => !(GATE_ORDER as readonly string[]).includes(g.gate)))
+  const n = (name: string) => gates.find((g) => g.gate === name)?.n ?? 0
+  const sumIn = n('accuracy') + n('glitch') + n('accepted')
+  const sumOut = n('drawn') + n('collapsed') + n('unwitnessed') + n('paused')
+
+  return {
+    at: new Date().toISOString(),
+    modules: [home, sompitra, way, laoka, indexes],
+    ingest: ingest ? { ...ingest, gates, checks: { received: n('received'), sumIn, sumInHolds: n('received') === sumIn, accepted: n('accepted'), sumOut, sumOutHolds: n('accepted') === sumOut } } : null,
+    ledger,
+    indexWarning: indexes.ok && /on_pings=0\b/.test(indexes.detail)
+      ? 'the W.A.Y tables have NO index on gps_pings or messages: every history load scans the whole table, which is the one schema fact that becomes a same-day outage as real data accumulates. See DB-REDESIGN.md §1a.'
+      : null,
+  }
+}
+
+// Zero the gate ledger so the next reading starts clean — the normal thing to
+// do before watching a real device for a while. See FleetDO's /reset-gates.
+admin.post('/diagnostics/reset', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+  try {
+    const id = c.env.FLEET_DO.idFromName('fleet')
+    const res = await c.env.FLEET_DO.get(id).fetch('https://fleet-do/reset-gates', { method: 'POST' })
+    if (res.status === 404) return c.redirect('/admin/diagnostics?err=stale_do')
+  } catch (e) {
+    return c.redirect('/admin/diagnostics?err=reset_failed')
+  }
+  return c.redirect('/admin/diagnostics?ok=reset')
+})
+
+admin.get('/diagnostics.json', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.json({ error: 'Admin only' }, 403)
+  return c.json(await buildDiagnostics(c))
+})
+
+admin.get('/diagnostics', async (c) => {
+  const gate = await requireCentralAdmin(c)
+  if (!gate) return c.redirect('/settings?err=only_admins')
+
+  const user = c.get('user')
+  const report = await buildDiagnostics(c)
+  const { ingest, ledger, modules } = report
+
+  const outcomeTone: Record<string, string> = {
+    refused: 'text-red-600 dark:text-red-400',
+    skipped: 'text-amber-600 dark:text-amber-400',
+    dropped: 'text-blue-600 dark:text-blue-400',
+    failed: 'text-red-600 dark:text-red-400',
+  }
+
+  return c.html(
+    <Layout title="Diagnostics" user={user}>
+      <div class="max-w-3xl mx-auto">
+        <div class="flex items-baseline justify-between mb-5">
+          <h2 class="text-xl font-bold">🩺 Diagnostics</h2>
+          <a href="/admin/diagnostics.json" class="text-xs font-mono text-blue-600 dark:text-blue-400 hover:underline">.json</a>
+        </div>
+
+        {c.req.query('ok') === 'reset' && (
+          <p class="mb-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl text-sm text-green-700 dark:text-green-400">
+            ✅ Gate counters cleared — the next reading starts from zero.
+          </p>
+        )}
+        {c.req.query('err') && (
+          <p class="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl text-sm text-red-600 dark:text-red-400">
+            {c.req.query('err') === 'stale_do'
+              ? 'The running Durable Object is running pre-ledger code, so there is nothing to clear.'
+              : 'The reset failed — the Durable Object could not be reached.'}
+          </p>
+        )}
+
+        <p class="text-sm text-gray-500 dark:text-gray-400 mb-5">
+          Everything every module was built to fail silently at — the tracking gates and
+          every notification that did not reach a phone. Read the sum lines first: they say
+          whether the numbers below can be trusted.
+        </p>
+
+        <Card title="Databases" icon="🗄️" className="mb-4">
+          <div class="space-y-2">
+            {modules.map((m) => (
+              <div class="flex items-start gap-3 text-sm">
+                <span class={m.ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}>
+                  {m.ok ? '●' : '✕'}
+                </span>
+                <span class="font-semibold w-32 shrink-0">{m.name}</span>
+                <span class="text-gray-600 dark:text-gray-400 font-mono text-xs break-all flex-1">{m.detail}</span>
+                <span class="text-gray-400 text-xs">{m.ms}ms</span>
+              </div>
+            ))}
+          </div>
+          {report.indexWarning && (
+            <p class="mt-3 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl text-xs text-amber-700 dark:text-amber-400">
+              ⚠️ {report.indexWarning}
+            </p>
+          )}
+        </Card>
+
+        <Card title="Tracking intake (W.A.Y)" icon="📡" className="mb-4">
+          {!ingest
+            ? <p class="text-sm text-gray-500">The FleetDO binding is not available.</p>
+            : ingest.error
+              ? <p class="text-sm text-amber-600 dark:text-amber-400">{ingest.error}</p>
+              : (
+                <div class="space-y-3">
+                  <div class="flex items-baseline justify-between">
+                    <p class="text-xs text-gray-500 dark:text-gray-400">
+                      Durable Object build: <span class="font-mono">{ingest.build ?? 'unknown'}</span>
+                    </p>
+                    <form method="post" action="/admin/diagnostics/reset">
+                      <button type="submit" class="text-xs px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 font-semibold">
+                        Reset counters
+                      </button>
+                    </form>
+                  </div>
+
+                  <div class="grid grid-cols-2 gap-2 text-sm">
+                    {ingest.gates.map((g) => (
+                      <div class={`flex justify-between px-3 py-2 rounded-lg ${g.n === 0 ? 'bg-gray-50/50 dark:bg-gray-700/20' : 'bg-gray-50 dark:bg-gray-700/40'}`}>
+                        <span class={`font-mono text-xs ${g.n === 0 ? 'text-gray-400 dark:text-gray-500' : 'text-gray-600 dark:text-gray-300'}`}>{g.gate}</span>
+                        <span class={g.n === 0 ? 'font-bold text-gray-400 dark:text-gray-500' : 'font-bold'}>{g.n}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div class="text-xs space-y-1 border-t border-gray-100 dark:border-gray-700 pt-3">
+                    <p class={ingest.checks.sumInHolds ? 'text-gray-500 dark:text-gray-400' : 'text-red-600 dark:text-red-400'}>
+                      {ingest.checks.sumInHolds ? '✅' : '⚠️'} received {ingest.checks.received} = accuracy + glitch + accepted ({ingest.checks.sumIn})
+                    </p>
+                    <p class={ingest.checks.sumOutHolds ? 'text-gray-500 dark:text-gray-400' : 'text-red-600 dark:text-red-400'}>
+                      {ingest.checks.sumOutHolds ? '✅' : '⚠️'} accepted {ingest.checks.accepted} = drawn + collapsed + unwitnessed + paused ({ingest.checks.sumOut})
+                    </p>
+                    <p class="text-gray-400">
+                      <span class="font-mono">report-unbelievable</span> is a correction, not a drop:
+                      that ping keeps going with the speed its own positions imply, so it lands in
+                      <span class="font-mono">accepted</span> and belongs to neither sum.
+                    </p>
+                    <p class="text-gray-400">
+                      Counters are durable (they survive an eviction) but scoped to the build that
+                      wrote them — a deploy that changes the Durable Object's code clears them, and
+                      “Reset counters” starts a clean reading on purpose.
+                    </p>                  </div>
+
+                  <div>
+                    <p class="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-2">Last drops &amp; corrections</p>
+                    {ingest.drops.length === 0
+                      ? <p class="text-xs text-gray-400">Nothing has been dropped or corrected since this build started counting.</p>
+                      : <div class="space-y-1">
+                        {ingest.drops.slice(0, 12).map((d) => (
+                          <div class="text-xs flex gap-2">
+                            {/* Date AND time, like the ledger rows below: a bare HH:MM:SS
+                                reads as "today" for a drop that arrived yesterday. Both are UTC. */}
+                            <span class="font-mono text-gray-400 shrink-0">{d.at.slice(5, 19).replace('T', ' ')}</span>
+                            <span class="font-mono text-blue-600 dark:text-blue-400 shrink-0 w-32 truncate">{d.gate}</span>
+                            <span class="text-gray-600 dark:text-gray-400 break-all">{d.detail}</span>
+                          </div>
+                        ))}
+                      </div>}
+                  </div>
+                </div>
+              )}
+        </Card>
+
+        <Card title="Notification ledger (all modules)" icon="🔔" className="mb-4">
+          {!ledger || ledger.error
+            ? <p class="text-sm text-amber-600 dark:text-amber-400">{ledger?.error ?? 'the ledger could not be read'}</p>
+            : ledger.total === 0
+              ? <p class="text-sm text-gray-500 dark:text-gray-400">
+                  Nothing has been recorded yet — which also means every push has been reaching its channel.
+                </p>
+              : (
+                <div class="space-y-3">
+                  <div class="text-xs text-gray-500 dark:text-gray-400">
+                    {ledger.total} entries, {ledger.first_at?.slice(0, 10)} → {ledger.last_at?.slice(0, 10)}
+                  </div>
+                  <div class="space-y-1">
+                    {ledger.counts.map((k) => (
+                      <div class="flex justify-between text-sm px-3 py-1.5 rounded-lg bg-gray-50 dark:bg-gray-700/40">
+                        <span class="text-xs">
+                          <span class="font-semibold">{k.module}</span>
+                          <span class="text-gray-400"> · </span>
+                          <span class="font-mono">{k.kind}</span>
+                          <span class={outcomeTone[k.outcome] || ''}> · {k.outcome}</span>
+                        </span>
+                        <span class="font-bold">{k.n}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div class="border-t border-gray-100 dark:border-gray-700 pt-3">
+                    <p class="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-2">Most recent</p>
+                    <div class="space-y-1">
+                      {ledger.events.slice(0, 15).map((e) => (
+                        <div class="text-xs flex gap-2">
+                          <span class="font-mono text-gray-400 shrink-0">{e.at.slice(5, 16).replace('T', ' ')}</span>
+                          <span class="font-mono text-gray-500 dark:text-gray-400 shrink-0">{e.module}</span>
+                          <span class="text-gray-600 dark:text-gray-400 break-all">{e.detail}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+        </Card>
+
+        <p class="text-xs text-gray-400 text-center mt-6">
+          Built {report.at.slice(0, 19).replace('T', ' ')} UTC · <a href="/admin" class="hover:underline">back to admin</a>
+        </p>
+      </div>
+    </Layout>
+  )
+})
+
+export default admin

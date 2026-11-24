@@ -1,0 +1,801 @@
+/** @jsxImportSource hono/jsx */
+import { Hono } from 'hono'
+import { Layout, Card, KineClientStats, TintStat } from '../views/layout'
+// The module colours come from the SAME table the tab bar renders, so the
+// doorways below can never drift from the tabs they open.
+import { HOME_TABS, Icon, ChatIconWithDot, enabledTabs, trackingEnabled } from '../views/app-chrome'
+import { requireAuth } from '../lib/middleware'
+import { mga, currentWeekBounds, currentMonthBounds, formatDate, userAccentColor, currentGradedColor, localDate, TZ_SQL_MODIFIER } from '../lib/utils'
+// Cash on hand is the MAIN POT only. Money moved into an envelope has left it,
+// and the purchases inside are paid from the envelope — so the two sums are
+// different slices of the ledger, defined once in src/lib/envelope.ts.
+import { MAIN_OUT_SQL, REAL_SPEND_SQL, envelopeBalances, envelopeTotal } from '../lib/envelope'
+import { classifyTransaction } from '../lib/notify'
+// The cupboard's one rule (`MED_SOON_DAYS`) and its one-line summary — the
+// same module /meds draws from, so the counts here cannot disagree with it.
+import { medsSummary } from '../lib/medicine'
+// The pantry's OWN queries. Home shows a summary of the shelves, and it has to
+// be the same arithmetic the Pantry screen draws from -- see `pantrySummary`.
+import { pantrySummary } from '../laoka/data/queries.js'
+// Kiné's ONE ledger (src/kine/ledger.ts): the row expressions every contract
+// query pastes, the balance rule, and the week's two figures. Home used to
+// carry two more copies of this arithmetic — the per-client subqueries below,
+// and a separate `due` SUM that multiplied by `sc.session_rate` with no
+// fallback, so a client with no session rate dropped out of Uncollected Dues.
+import { DELIVERED_COUNT_SQL, PAID_SQL, clientLedger, weekLedger } from '../kine/ledger'
+import type { Env, User, Transaction, DebtCreditAccount } from '../db/schema'
+
+const dashboard = new Hono<{ Bindings: Env; Variables: { user: User } }>()
+dashboard.use('*', requireAuth)
+
+dashboard.get('/', async (c) => {
+  const user = c.get('user')
+  // Home is STATIC: the current household month (24th → 23rd, named for its end
+  // month) for money flow, current SAT–FRI week for Kiné.
+  const month = currentMonthBounds()
+  const week = currentWeekBounds(0)
+
+  // ── Aggregate queries ──────────────────────────────────────
+  const [incomeRow, expenseRow, allIncomeRow, allMainOutRow, debtRow, creditRow, recentTxns, debts, kineClients, kineWeek, todayTxns] = await Promise.all([
+    c.env.DB.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='income' AND date BETWEEN ? AND ?`).bind(month.start, month.end).first<{ total: number }>(),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(t.amount),0) AS total FROM transactions t WHERE ${REAL_SPEND_SQL} AND t.date BETWEEN ? AND ?`).bind(month.start, month.end).first<{ total: number }>(),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='income'`).first<{ total: number }>(),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(t.amount),0) AS total FROM transactions t LEFT JOIN categories c ON t.category_id = c.id WHERE ${MAIN_OUT_SQL}`).first<{ total: number }>(),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(current_balance),0) AS total FROM debt_credit_accounts WHERE type='debt' AND current_balance > 0`).first<{ total: number }>(),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(current_balance),0) AS total FROM debt_credit_accounts WHERE type='credit' AND current_balance > 0`).first<{ total: number }>(),
+    c.env.DB.prepare(
+      `SELECT t.*, c.name AS category_name, cg.name AS group_name, ia.name AS income_account_name, u.display_name AS added_by_display_name
+       FROM transactions t LEFT JOIN categories c ON t.category_id = c.id LEFT JOIN category_groups cg ON c.group_id = cg.id
+       LEFT JOIN income_accounts ia ON t.income_account_id = ia.id LEFT JOIN users u ON t.added_by_user_id = u.id
+       ORDER BY t.date DESC, t.created_at DESC LIMIT 5`
+    ).all<Transaction>(),
+    c.env.DB.prepare(`SELECT * FROM debt_credit_accounts WHERE current_balance > 0 ORDER BY created_at DESC LIMIT 3`).all<DebtCreditAccount>(),
+    c.env.DB.prepare(
+      `SELECT
+         cu.id          AS customer_id,
+         cu.name        AS customer_name,
+         cu.default_rate AS default_rate,
+         sc.session_rate AS session_rate,
+         ${DELIVERED_COUNT_SQL} AS delivered,
+         ${PAID_SQL} AS paid
+       FROM customers cu
+       JOIN service_contracts sc ON sc.customer_id = cu.id AND sc.status = 'active'
+       ORDER BY cu.created_at DESC`
+    ).all<{ customer_id: string; customer_name: string; default_rate: number; session_rate: number | null; delivered: number; paid: number }>(),
+    weekLedger(c.env.DB, week),
+    c.env.DB.prepare(
+      `SELECT t.*, c.name AS category_name, cg.name AS group_name, ia.name AS income_account_name, u.display_name AS added_by_display_name
+       FROM transactions t
+       LEFT JOIN categories c ON t.category_id = c.id
+       LEFT JOIN category_groups cg ON c.group_id = cg.id
+       LEFT JOIN income_accounts ia ON t.income_account_id = ia.id
+       LEFT JOIN users u ON t.added_by_user_id = u.id
+       WHERE date(t.created_at, ?) = ?
+       ORDER BY t.created_at DESC
+       LIMIT 8`
+    ).bind(TZ_SQL_MODIFIER, localDate()).all<Transaction>()
+  ])
+
+  const totalIncome   = incomeRow?.total  ?? 0     // this month
+  const totalExpenses = expenseRow?.total ?? 0     // this month, real spending
+  const allIncome     = allIncomeRow?.total  ?? 0
+  const allMainOut    = allMainOutRow?.total ?? 0
+  // The main pot: funding has left it, envelope purchases never touch it again.
+  const currentCash   = allIncome - allMainOut
+  // Month-scoped, like the Budget card: `left` is the envelope's whole balance
+  // either way, but the month is what makes the three parts add up on screen.
+  const envelopes     = await envelopeBalances(c.env.DB, month)
+  const setAside      = envelopeTotal(envelopes)
+  // The preview under the anchor: one line per open envelope, in category
+  // order. `funded` is this month's funding and `left` is what the envelope
+  // still holds (the same `left` the line above sums); the figure at the right
+  // edge is the category's expected budget (`target_budget`).
+  const envelopeRows = await c.env.DB.prepare(
+    `SELECT c.id, c.name, c.target_budget FROM categories c JOIN category_groups cg ON cg.id = c.group_id
+      WHERE c.envelope_from IS NOT NULL ORDER BY cg.sort_order, c.sort_order`
+  ).all<{ id: string; name: string; target_budget: number }>()
+  const envelopePreview = envelopeRows.results.map(cat => {
+    const bal = envelopes.get(cat.id)
+    return { id: cat.id, name: cat.name, funded: bal?.funded ?? 0, left: bal?.left ?? 0, budget: cat.target_budget }
+  }).filter(e => e.funded !== 0 || e.left !== 0)
+  const bareAmount = (n: number) => mga(n).slice(3)
+  const totalDebt     = debtRow?.total    ?? 0
+  const totalCredit   = creditRow?.total  ?? 0
+
+  // Uncollected Dues = money owed TO us: unpaid Kiné sessions + outstanding
+  // credits (money lent out). The Kiné half is the SAME rows the tiles below
+  // draw (`kineClients`), summed through the one ledger rule — a second SUM in
+  // SQL is how the anchor and the tiles used to disagree, and its missing
+  // COALESCE dropped contracts with no session_rate out of net worth entirely.
+  const kineDues = kineClients.results.reduce((sum, row) => sum + clientLedger(row).balance, 0)
+  const uncollectedDues = kineDues + totalCredit
+  // Envelope money is still the household's, so it comes back here — moving it
+  // into an envelope must not make the family poorer on this tile.
+  const netWorth = currentCash + setAside + uncollectedDues - totalDebt
+
+  const sankeyIncomes = await c.env.DB.prepare(
+    `SELECT ia.name, u.display_name, COALESCE(SUM(t.amount),0) AS total
+     FROM transactions t JOIN income_accounts ia ON t.income_account_id = ia.id JOIN users u ON ia.user_id = u.id
+     WHERE t.type='income' AND t.date BETWEEN ? AND ? GROUP BY ia.id`
+  ).bind(month.start, month.end).all<{ name: string; display_name: string; total: number }>()
+
+  const sankeyExpenses = await c.env.DB.prepare(
+    `SELECT cg.name AS group_name, COALESCE(SUM(t.amount),0) AS total
+     FROM transactions t JOIN categories c ON t.category_id = c.id JOIN category_groups cg ON c.group_id = cg.id
+     WHERE ${REAL_SPEND_SQL} AND t.date BETWEEN ? AND ? GROUP BY cg.id`
+  ).bind(month.start, month.end).all<{ group_name: string; total: number }>()
+
+  const weekLabel = `${formatDate(week.start)} – ${formatDate(week.end)}`
+
+  // ── The one proportion this page leads with ──
+  // Cash on hand is the figure the household actually reads, and the month's two
+  // directions are shown once, as a single rule under it, instead of as two more
+  // equal boxes beside it. Guarded on a zero month: with nothing moved, the bar
+  // is a plain rule, never a full-red one claiming all spending.
+  const monthFlow = totalIncome + totalExpenses
+  const inShare = monthFlow > 0 ? Math.round((totalIncome / monthFlow) * 100) : 0
+  const netMonth = totalIncome - totalExpenses
+
+  // ── Today's activity (derived, state-free: vanishes each day) ──
+  // Same classifier that drives the ntfy push, so wording never diverges.
+  const notifs = todayTxns.results.map(classifyTransaction)
+
+  const accents: Record<string, { border: string; text: string }> = {
+    orange: { border: 'border-orange-500', text: 'text-orange-500' },
+    blue:   { border: 'border-blue-500',   text: 'text-blue-500' },
+    red:    { border: 'border-red-500',    text: 'text-red-500' },
+    green:  { border: 'border-green-500',  text: 'text-green-600 dark:text-green-400' },
+    violet: { border: 'border-violet-500', text: 'text-violet-600 dark:text-violet-400' },
+  }
+
+  // The three modules that are not a money section, each wearing its own tab
+  // colour. Hard-coding hues here is what made this card the odd one out: Chat
+  // was sky blue on the dashboard and violet in the tab bar two centimetres
+  // below it, and WAY was indigo in one place and sky in the other. Reading
+  // HOME_TABS means the doorway and the tab are literally the same value.
+  // Only the modules THIS deployment serves. The Cloudflare build has all
+  // three; the SQLite container has none, and the card (and its whole row)
+  // simply does not render rather than offering a dead tab.
+  const doorways = (['way', 'laoka', 'chat'] as const).flatMap(key => {
+    const tab = enabledTabs().find(t => t.tab === key)
+    if (!tab) return []
+    return [{
+      href: tab.href,
+      color: tab.color,
+      label: tab.label,
+      // Each tab carries an image mark OR an inline glyph, never both.
+      img: 'img' in tab ? tab.img : undefined,
+      svg: 'svg' in tab ? tab.svg : undefined,
+      blurb: key === 'way' ? 'the family map' : key === 'laoka' ? 'meals for the week' : 'the family room',
+    }]
+  })
+  const chatEnabled = enabledTabs().some(t => t.tab === 'chat')
+  const laokaEnabled = enabledTabs().some(t => t.tab === 'laoka')
+
+  // ── The pantry, for the card at the foot of this page ──
+  // It lives in Laoka's own database, and its queries ask for `env.DB` (the
+  // binding name Laoka uses) while knowing nothing about which worker calls
+  // them — so they are handed a DB-scoped env rather than the whole one.
+  // A Laoka binding that is missing or unreadable must not take Home down with
+  // it: the card says it cannot read the shelves instead of showing zeros, which
+  // would claim an empty pantry.
+  let pantry: { items: number; categories: number; toBuy: number } | null = null
+  try {
+    pantry = await pantrySummary({ DB: c.env.LAOKA_DB })
+  } catch {
+    pantry = null
+  }
+  // The cupboard, in one line — the same shape as the pantry card at the foot
+  // of this page. A database that has not had the medications migration yet
+  // must not take Home down: `meds` stays null and the card says so rather
+  // than claiming an empty cupboard.
+  let meds: { items: number; expired: number; soon: number } | null = null
+  try {
+    meds = await medsSummary(c.env.DB)
+  } catch {
+    meds = null
+  }
+  // Laoka's own colour, from the same table the tab bar renders. Read with a
+  // fallback rather than asserted: the card is decoration, and a tab table that
+  // ever loses its Laoka entry must not 500 the page the household lands on.
+  const laokaTab = HOME_TABS.find(t => t.tab === 'laoka')
+  const laokaColor = laokaTab ? laokaTab.color : '#ea580c'
+  const laokaInk = laokaTab ? laokaTab.ink : '#c2410c'
+  // The chat room's colour and mark, read from the same table for the same
+  // reason: the unread card below must wear the violet of the Chat tab and not
+  // a hue of its own, and its icon has to be the one the tab bar shows.
+  const chatTab = HOME_TABS.find(t => t.tab === 'chat')
+  const chatColor = chatTab ? chatTab.color : '#7c3aed'
+
+  return c.html(
+    <Layout title="Dashboard" user={user} activeTab="dashboard">
+      {/* ── The anchor ──
+          ONE figure leads this page: what is in hand. Everything about the
+          month hangs off it — the period, the proportion of money in against
+          money out, and the three totals — so the household reads one thing in
+          one second instead of comparing six equal boxes.
+
+          It used to be six identical pastel tiles, which is the reason "cash on
+          hand" carried exactly as much weight as "Dues": same size, same
+          saturation, same radius, same shadow. The palette's meaning survives
+          intact — green = money in, red = money out, teal = net, purple = owed
+          to us, orange = we owe — but it is now spent on the FIGURES, not on
+          the surface behind them. */}
+      <div class="grid gap-4 mb-4 lg:grid-cols-3">
+        <section class="card card-lg rise p-4 sm:p-5 lg:col-span-2 flex flex-col justify-between">
+          <div class="flex items-baseline justify-between gap-3">
+            <p class="t-label">Cash on hand</p>
+            {/* The period belongs to the figure it describes (it used to be an
+                icon centred on a line of its own, above nothing). Home has no
+                prev/next — that lives under Budget. */}
+            <p class="t-micro flex items-center gap-1">
+              <Icon name="calendar" className="w-[13px] h-[13px]" />{month.label}
+            </p>
+          </div>
+          <p class={`t-anchor mt-1.5 ${currentGradedColor(currentCash)}`}>{mga(currentCash)}</p>
+          {setAside !== 0 && (
+            <p class="text-[11px] text-gray-400 mt-1">{mga(setAside)} set aside in envelopes</p>
+          )}
+          {envelopePreview.length > 0 && (
+            <div class="mt-1.5 text-[10px] leading-relaxed space-y-1.5">
+              {envelopePreview.map(e => {
+                // Funded against the month's expected budget, in the same
+                // traffic light Budget uses: red once it is exceeded, yellow
+                // from 80%, violet (the envelope colour) below that. The width
+                // is capped so an overfunded envelope still reads as full.
+                const pct = e.budget > 0 ? Math.max(0, Math.min(100, Math.round((e.funded / e.budget) * 100))) : 0
+                const barColor = e.budget > 0 && e.funded > e.budget
+                  ? 'bg-red-500'
+                  : e.budget > 0 && e.funded >= e.budget * 0.8
+                    ? 'bg-yellow-400'
+                    : 'bg-violet-500 dark:bg-violet-400'
+                return (
+                  <div key={e.id}>
+                    <div class="flex items-baseline justify-between gap-3">
+                      <span class="truncate text-gray-400 dark:text-gray-500">
+                        <span class="font-semibold text-gray-600 dark:text-gray-300">{e.name}</span>{' '}
+                        <span class="text-gray-500 dark:text-gray-400 tabular-nums">
+                          Ar {bareAmount(e.funded)} / {bareAmount(e.left)}
+                        </span>
+                      </span>
+                      <span class="text-gray-400 dark:text-gray-500 tabular-nums whitespace-nowrap">{e.budget > 0 ? mga(e.budget) : '—'}</span>
+                    </div>
+                    <div class="mt-0.5 h-[3px] rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700" aria-hidden="true">
+                      {pct > 0 && <div class={`h-full rounded-full ${barColor}`} style={{ width: `${pct}%` }} />}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Money in against money out, as one bar. The colours are the money
+              vocabulary itself, so it needs no legend. */}
+          <div class="mt-3.5 h-1.5 rounded-full overflow-hidden draw" style={{ backgroundColor: 'var(--rule)' }}>
+            {monthFlow > 0 && (
+              <span class="flex h-full">
+                <span class="h-full bg-green-500" style={{ width: `${inShare}%` }} />
+                <span class="h-full bg-red-500" style={{ width: `${100 - inShare}%` }} />
+              </span>
+            )}
+          </div>
+
+          <div class="hairline mt-3.5 pt-3 grid grid-cols-3 gap-2">
+            <div>
+              <p class="t-micro">In</p>
+              <p class="t-value text-green-600 dark:text-green-400">{mga(totalIncome)}</p>
+            </div>
+            <div>
+              <p class="t-micro">Out</p>
+              <p class="t-value text-red-500">{mga(totalExpenses)}</p>
+            </div>
+            <div>
+              <p class="t-micro">Net</p>
+              <p class={`t-value ${netMonth >= 0 ? 'text-teal-600 dark:text-teal-400' : 'text-orange-600 dark:text-orange-400'}`}>{mga(netMonth)}</p>
+            </div>
+          </div>
+        </section>
+
+        {/* ── Unread chat — the second box, and second on purpose ──
+            The home screen's job is to say what needs a person, and a message
+            from the household is the one thing here that is addressed to
+            someone rather than summed up. So it sits immediately after the
+            month's own figure, ahead of the rooms — read before anything that
+            only reports or only navigates.
+
+            It is the SAME watermark as the dot on the Chat tab, told at the
+            size this screen has room for: how many arrived since this device
+            last looked, and WHICH ones — one clipped line each, newest first,
+            so the card answers "what did I miss" instead of naming one of the
+            three messages underneath a count of three. Not a second counter to
+            keep in sync — see CHAT_UNREAD_SCRIPT.
+
+            Rendered hidden and revealed by that script, because the watermark
+            lives in the browser and the count comes from the DO. With nothing
+            unread the card is not empty, it is ABSENT: `display: none` takes it
+            out of the grid, so the rooms take back the slot beside the figure
+            (see `.rooms-grid` in CHROME_CSS) and the figure keeps the top of
+            the page. Text is filled by textContent only. */}
+        {chatEnabled && (
+        <a
+          href="/chat"
+          data-chat-unread-card
+          data-mine={user?.username ?? ''}
+          class="unread-card card tab-tint lg:col-span-1 px-3.5 py-3 items-center gap-3 transition-transform active:scale-[.99]"
+          style={{ '--tab': chatColor, backgroundColor: chatColor + '0f', borderColor: chatColor + '33' }}
+        >
+          <span class="shrink-0">
+            {chatTab ? <ChatIconWithDot item={chatTab} /> : <Icon name="chat" className="w-6 h-6" />}
+          </span>
+          <span class="min-w-0 flex-1">
+            {/* Filled at runtime: "3 new messages". The static text is what a
+                reader of the source sees — the card is hidden until the script
+                puts a real count in it. */}
+            <span class="block text-[13.5px] font-semibold" data-unread-count>New messages</span>
+            {/* The lines themselves, one row each, built by the script from the
+                server's answer: a row per unread message is a variable number
+                of them, so they are appended as elements rather than rendered
+                here. A module's system row has no sender and gets its text
+                alone, which is how the chat draws one too. */}
+            <span class="unread-rows" data-unread-rows></span>
+          </span>
+          <span class="shrink-0 opacity-70"><Icon name="chev-right" className="w-4 h-4" /></span>
+        </a>
+        )}
+
+        {/* The rest of the super app — one tap each, same shell, same session.
+            WAY and Laoka open as tabs of this app (chromeless embeds); Chat is
+            the family room (WAY's own chat engine). Three rooms listed beside
+            the number on a desktop, three across on a phone — and moved to
+            their own row across the page while the unread card holds this
+            slot (`.rooms-card` / `.rooms-grid` in CHROME_CSS). */}
+        {doorways.length > 0 && (
+        <Card title="Around the house" icon="house" className="rooms-card lg:col-span-1">
+          <div class="rooms-grid">
+            {doorways.map(item => (
+              <a
+                href={item.href}
+                style={{
+                  '--tab': item.color,
+                  // A whisper of the module's own colour as the card's surface:
+                  // 8% fill / 20% edge. Derived from the tab colour rather than
+                  // hand-picked pastels, so the three cards read as one family
+                  // with the tab bar instead of three different apps.
+                  backgroundColor: item.color + '14',
+                  borderColor: item.color + '33',
+                }}
+                class="tab-tint flex flex-col lg:flex-row items-center lg:items-center gap-1.5 lg:gap-2.5 rounded-2xl px-2 py-2.5 lg:px-3 lg:py-3 border transition-transform active:scale-[.97]"
+              >
+                {item.img
+                  ? <img src={item.img} alt="" class="w-7 h-7 lg:w-8 lg:h-8 rounded-lg shrink-0" />
+                  : <span class="shrink-0"><Icon name={item.svg ?? ''} className="w-7 h-7 lg:w-8 lg:h-8" /></span>}
+                <span class="min-w-0 text-center lg:text-left">
+                  <span class="block text-[13px] lg:text-sm font-bold">{item.label}</span>
+                  <span class="block t-micro truncate">{item.blurb}</span>
+                </span>
+              </a>
+            ))}
+          </div>
+        </Card>
+        )}
+      </div>
+
+      {notifs.length > 0 && (
+        <Card title="Today's Activity" icon="bell" className="mb-4">
+          <div class="space-y-0.5">
+            {notifs.map(n => (
+              <a href={n.href} class={`block py-2 pl-3 border-l-2 ${accents[n.accent].border} hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors`}>
+                <p class={`text-[13.5px] font-semibold ${accents[n.accent].text}`}>{n.line1}</p>
+                {n.line2 && <p class="t-micro mt-0.5">{n.line2}</p>}
+              </a>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* ── Two panels side by side on a desktop, stacked on a phone ──
+          The two carry DIFFERENT shapes on purpose, because they are read
+          differently.
+
+          Balances is a ledger: "label left, figure right, a hairline between
+          rows" — three different accounts read down a list, where the label has
+          to carry the direction in words ("Uncollected Dues" and a bare "Dues"
+          sat two centimetres apart and meant opposite ways).
+
+          The Kiné summary is a comparison: its figures are read ACROSS, against
+          each other and against the week (sessions in, money in, money still
+          owed), so they are tiles side by side inside the one card. Both wear
+          the same money palette — purple = owed to us, orange = we owe, teal =
+          a period's net, green = money in — so the colour means one thing on
+          the page however the figures are arranged. */}
+      <div class="grid gap-4 mb-4 md:grid-cols-2">
+        <Card title="Balances" icon="swap" className="min-w-0">
+          <div class="ledger">
+            <TintStat label="Owed to us" sub="Kiné sessions and credits we gave" value={mga(uncollectedDues)} tone="text-purple-600 dark:text-purple-400" />
+            <TintStat label="What we owe" sub="open debts" value={mga(totalDebt)} tone="text-orange-600 dark:text-orange-400" />
+            <TintStat label="Net worth" sub="cash + owed − what we owe" value={mga(netWorth)} tone={netWorth >= 0 ? 'text-teal-600 dark:text-teal-400' : 'text-red-600 dark:text-red-400'} />
+          </div>
+        </Card>
+
+        <Card title="Kiné Summary" icon="pulse" className="min-w-0">
+        {/* Weekly totals (current SAT–FRI week) as TWO TILES: the sessions
+            delivered and the money they brought, side by side, because the
+            question asked of them is "how much money per session" — a
+            comparison, not a list.
+
+            The colours are the tile language in CHROME_CSS: BLUE is the session
+            COUNT (a count is not money, so it takes the one hue the money
+            palette does not own), GREEN is money that came in — the same green
+            every other franc coming in wears on this page (paid was orange
+            here once, which is what the palette uses for money going OUT), and
+            ORANGE is a balance still to settle, which the per-client tiles
+            below wear with the direction inside the figure. */}
+        <p class="t-micro flex items-center gap-1 mb-2">
+          <Icon name="calendar" className="w-[13px] h-[13px]" />{weekLabel}
+        </p>
+        <div class="grid grid-cols-2 gap-2 mb-3">
+          <div class="tile tile-tint text-blue-600 dark:text-blue-400">
+            <p class="t-label">Sessions this week</p>
+            <p class="t-value">{kineWeek.delivered}</p>
+          </div>
+          <div class="tile tile-tint text-green-600 dark:text-green-400">
+            <p class="t-label">Paid this week</p>
+            <p class="t-value truncate" title={mga(kineWeek.paid)}>{mga(kineWeek.paid)}</p>
+          </div>
+        </div>
+
+        {/* Per-client active summary — one block per client, its three figures
+            as the three tiles above (see `KineClientStats`). Home reads the
+            same ledger /kine draws, through the same module: this card cannot
+            disagree with the tab, and a name here is a label, not yet a link. */}
+        {kineClients.results.length === 0
+          ? <p class="t-micro text-center py-3">No active clients yet</p>
+          : (
+            <div class="space-y-3">
+              {kineClients.results.map(client => {
+                const ledger = clientLedger(client)
+                return (
+                  <div>
+                    <p class="text-[13.5px] font-semibold mb-1.5 truncate">{client.customer_name}</p>
+                    <KineClientStats ledger={ledger} />
+                  </div>
+                )
+              })}
+            </div>
+          )
+        }
+        <p class="t-micro mt-3 text-center">🟢 balanced · 🟡 prepaid (we owe sessions) · 🔴 owes sessions</p>
+        </Card>
+      </div>
+
+      <Card title="Cash Flow" icon="trend" className="mb-4">
+        <div id="sankey-container" style="height:240px" class="w-full">
+          <canvas id="sankeyCanvas" class="w-full h-full" />
+        </div>
+        <script dangerouslySetInnerHTML={{ __html: `
+          (function() {
+            const incomes  = ${JSON.stringify(sankeyIncomes.results)};
+            const expenses = ${JSON.stringify(sankeyExpenses.results)};
+            const totalIn  = ${totalIncome};
+            const totalExp = ${totalExpenses};
+            const net = totalIn - totalExp;
+            const canvas = document.getElementById('sankeyCanvas');
+            const container = document.getElementById('sankey-container');
+            const dpr = window.devicePixelRatio || 1;
+
+            // Subtle color-wheel shades: fixed hue, small lightness steps.
+            function greenShades(count) {
+              const out = [];
+              for (let i = 0; i < count; i++) out.push('hsl(155, 55%, ' + (26 + i * 3) + '%)');
+              return out;
+            }
+            function orangeShades(count) {
+              const out = [];
+              for (let i = 0; i < count; i++) out.push('hsl(22, 70%, ' + (38 + i * 3) + '%)');
+              return out;
+            }
+
+            // Current balance grading (matches the Current card)
+            function currentFill(v) {
+              if (v < 0) return '#ef4444';
+              if (v < 200000) return '#eab308';
+              if (v < 500000) return '#3b82f6';
+              return '#16a34a';
+            }
+
+            function resize() {
+              canvas.width  = container.clientWidth  * dpr;
+              canvas.height = container.clientHeight * dpr;
+              canvas.style.width  = container.clientWidth  + 'px';
+              canvas.style.height = container.clientHeight + 'px';
+              drawSankey();
+            }
+
+            function layoutColumn(nodes, pad, gap, H) {
+              const avail = H - pad * 2;
+              const gapsTotal = Math.max(0, nodes.length - 1) * gap;
+              const heightsTotal = Math.max(0, avail - gapsTotal);
+              const n = nodes.length;
+              const total = nodes.reduce(function(s, node) { return s + node.value; }, 0);
+              const maxH = heightsTotal * 0.4;
+
+              let heights = nodes.map(function(node) {
+                return total > 0 ? (node.value / total) * heightsTotal : (heightsTotal / Math.max(1, n));
+              });
+
+              // Cap any branch at 40% and redistribute the remainder among the rest.
+              for (let iter = 0; iter < 12; iter++) {
+                const cappedIdx = [];
+                const uncappedIdx = [];
+                heights.forEach(function(h, i) {
+                  if (h >= maxH - 0.5) cappedIdx.push(i); else uncappedIdx.push(i);
+                });
+                if (cappedIdx.length === 0) break;
+                if (uncappedIdx.length === 0) {
+                  heights = nodes.map(function() { return heightsTotal / Math.max(1, n); });
+                  break;
+                }
+                const cappedSum = cappedIdx.reduce(function(s, i) { return s + maxH; }, 0);
+                const remaining = Math.max(0, heightsTotal - cappedSum);
+                const uncappedValue = uncappedIdx.reduce(function(s, i) { return s + nodes[i].value; }, 0);
+                if (uncappedValue <= 0) break;
+                const next = heights.slice();
+                cappedIdx.forEach(function(i) { next[i] = maxH; });
+                uncappedIdx.forEach(function(i) { next[i] = (nodes[i].value / uncappedValue) * remaining; });
+                const anyOver = uncappedIdx.some(function(i) { return next[i] >= maxH - 0.5; });
+                heights = next;
+                if (!anyOver) break;
+              }
+
+              let y = pad;
+              return nodes.map(function(node, i) {
+                const item = { label: node.label, value: node.value, color: node.color, y: y, h: heights[i] };
+                y += heights[i] + gap;
+                return item;
+              });
+            }
+
+            function drawSankey() {
+              const W = canvas.width, H = canvas.height;
+              const ctx = canvas.getContext('2d');
+              ctx.clearRect(0, 0, W, H);
+              const pad = 8 * dpr, nodeW = 96 * dpr, gap = 6 * dpr;
+
+              const greens  = greenShades(incomes.length > 0 ? incomes.length : 1);
+              const oranges = orangeShades(expenses.length > 0 ? expenses.length : 1);
+
+              const incomeNodes = incomes.length > 0
+                ? incomes.map(function(i, idx) { return { label: i.name, value: i.total, color: greens[idx] }; })
+                : [{ label: 'No income', value: 0, color: '#6b7280' }];
+
+              const expNodes = expenses.map(function(e, idx) { return { label: e.group_name, value: e.total, color: oranges[idx] }; });
+
+              const left  = layoutColumn(incomeNodes, pad, gap, H);
+              const right = layoutColumn(expNodes, pad, gap, H);
+
+              const centerH = Math.min(80 * dpr, H - pad * 2);
+              const centerX = W / 2 - nodeW / 2;
+              const centerY = H / 2 - centerH / 2;
+
+              function drawNode(x, y, w, h, label, color) {
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.roundRect(x, y, w, h, 6 * dpr);
+                ctx.fill();
+                if (h >= 14 * dpr) {
+                  ctx.fillStyle = '#fff';
+                  ctx.font = 'bold ' + (9 * dpr) + 'px sans-serif';
+                  ctx.textAlign = 'center';
+                  ctx.textBaseline = 'middle';
+                  const text = label.length > 16 ? label.slice(0, 15) + '…' : label;
+                  ctx.fillText(text, x + w / 2, y + h / 2);
+                }
+              }
+
+              function drawFlow(x1, y1, x2, y2, color, h) {
+                ctx.globalAlpha = 0.55;
+                ctx.strokeStyle = color;
+                ctx.lineWidth = Math.max(2 * dpr, Math.min(h * 0.4, 16 * dpr));
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                ctx.bezierCurveTo((x1 + x2) / 2, y1, (x1 + x2) / 2, y2, x2, y2);
+                ctx.stroke();
+                ctx.globalAlpha = 1;
+              }
+
+              left.forEach(function(n) {
+                drawNode(pad, n.y, nodeW, n.h, n.label, n.color);
+                drawFlow(pad + nodeW, n.y + n.h / 2, centerX, centerY + centerH / 2, n.color, n.h);
+              });
+
+              // Center pool — solid colour graded by the Current balance
+              ctx.fillStyle = currentFill(net);
+              ctx.beginPath();
+              ctx.roundRect(centerX, centerY, nodeW, centerH, 8 * dpr);
+              ctx.fill();
+              ctx.fillStyle = '#fff';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.font = 'bold ' + (10 * dpr) + 'px sans-serif';
+              ctx.fillText('Current', centerX + nodeW / 2, centerY + centerH / 2 - 9 * dpr);
+              ctx.font = 'bold ' + (9 * dpr) + 'px sans-serif';
+              ctx.fillText('Ar ' + net.toLocaleString('en-US'), centerX + nodeW / 2, centerY + centerH / 2 + 9 * dpr);
+
+              right.forEach(function(n) {
+                drawNode(W - pad - nodeW, n.y, nodeW, n.h, n.label, n.color);
+                drawFlow(centerX + nodeW, centerY + centerH / 2, W - pad - nodeW, n.y + n.h / 2, n.color, n.h);
+              });
+            }
+
+            window.addEventListener('resize', resize);
+            resize();
+          })();
+        `}} />
+      </Card>
+
+      {/* `min-w-0` on both cards, and it is load-bearing: these are grid items,
+          and a grid item's automatic minimum size is its MIN-CONTENT width. A
+          transaction description is rendered with `truncate`, which means
+          `white-space: nowrap` — so one long description (a Laoka import reads
+          "Laoka shopping 2026-09-12 – 2026-09-18") makes its min-content ~415px
+          and the whole PAGE gains a horizontal scrollbar on a 422px phone,
+          even though the row above it already had min-w-0. The floor has to be
+          removed on the item that IS the grid item, not only inside it. */}
+      <div class="grid md:grid-cols-2 gap-4">
+        <Card title="Recent Transactions" icon="list" className="min-w-0">
+          {recentTxns.results.length === 0 ? <p class="t-micro text-center py-4">No transactions yet</p> : (
+            <div class="ledger">
+              {recentTxns.results.map(t => (
+                <div class="flex items-center justify-between gap-3 py-2.5">
+                  <div class="min-w-0 flex items-center gap-2.5">
+                    {/* The person is the dot's own colour (see userAccentColor),
+                        so the row no longer spends a line on "Group · Name".
+                        The name is still there for a screen reader. */}
+                    <span class={`w-1 h-5 shrink-0 rounded-full ${userAccentColor(t.added_by_display_name)}`} title={t.added_by_display_name || ''} />
+                    <div class="min-w-0">
+                      <p class="text-[13.5px] font-semibold truncate">{t.description || t.category_name || t.income_account_name || '—'}</p>
+                      <p class="t-micro truncate">{t.group_name || t.category_name || t.added_by_display_name}</p>
+                    </div>
+                  </div>
+                  <div class="text-right shrink-0">
+                    <span class={`block t-value whitespace-nowrap ${t.type === 'income' ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
+                      {t.type === 'income' ? '+' : '-'}{mga(t.amount)}
+                    </span>
+                    <a href={`/budget/edit/${t.id}`} class="t-micro underline decoration-dotted">Edit</a>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div class="mt-4 flex gap-2">
+            <a href="/budget/add-expense" class="flex-1 text-center text-sm py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 font-medium">+ Expense</a>
+            <a href="/budget/add-income" class="flex-1 text-center text-sm py-2 rounded-xl bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-900/40 font-medium">+ Income</a>
+          </div>
+        </Card>
+
+        <Card title="Debts & Credits" icon="swap" className="min-w-0">
+          {debts.results.length === 0 ? <p class="t-micro text-center py-4">No open debts</p> : (
+            <div class="ledger">
+              {debts.results.map(d => (
+                <div class="flex items-center justify-between gap-3 py-2.5">
+                  <div class="min-w-0">
+                    <p class="text-[13.5px] font-semibold truncate">{d.person_name}</p>
+                    {/* Orange = we owe, purple = owed to us — the same pair the
+                        Debts page and the Balances rows use. */}
+                    <span class={`t-micro font-semibold ${d.type === 'debt' ? 'text-orange-600 dark:text-orange-400' : 'text-purple-600 dark:text-purple-400'}`}>
+                      {d.type === 'debt' ? 'We owe' : 'They owe us'}
+                    </span>
+                  </div>
+                  {/* The amount used to be orange whatever the direction, so a
+                      credit we are owed printed in the "we owe" colour. */}
+                  <span class={`t-value shrink-0 ${d.type === 'debt' ? 'text-orange-600 dark:text-orange-400' : 'text-purple-600 dark:text-purple-400'}`}>{mga(d.current_balance)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div class="mt-4">
+            <a href="/debts" class="flex items-center justify-center gap-1 text-[13px] py-2 rounded-xl bg-gray-50 dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 font-semibold" style={{ color: 'var(--ink-2)' }}>
+              View all <Icon name="chev-right" className="w-3.5 h-3.5" />
+            </a>
+          </div>
+        </Card>
+      </div>
+
+      {/* The pantry in one line, and one tap away. It answers "is anything
+          needed?" without opening Laoka, and every number comes from the Pantry
+          screen's OWN queries (`pantrySummary` → `getPantryTree` +
+          `listPantryToBuy`), so a summary cannot disagree with the list it
+          summarises. The link carries the tab, so it lands ON the pantry. */}
+      {laokaEnabled && (
+      <Card title="Pantry" icon="bowl" className="mt-4">
+        <a href="/laoka/?tab=pantry" class="flex items-center gap-2 -mb-0.5 active:scale-[0.99] transition-transform">
+          <span class="flex flex-wrap items-center gap-1.5 flex-1 min-w-0">
+            {pantry ? (
+              <>
+                <span class="text-[11px] px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300">
+                  {pantry.items} {pantry.items === 1 ? 'item' : 'items'}
+                </span>
+                <span class="text-[11px] px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300">
+                  {pantry.categories} {pantry.categories === 1 ? 'category' : 'categories'}
+                </span>
+                {pantry.toBuy > 0 ? (
+                  // Orange is Laoka's own colour, so "to buy" reads as the same
+                  // fact the Pantry tab highlights.
+                  <span
+                    class="text-[11px] px-2 py-0.5 rounded-full font-bold"
+                    style={{ backgroundColor: `${laokaColor}1f`, color: laokaInk }}
+                  >
+                    {pantry.toBuy} to buy
+                  </span>
+                ) : (
+                  <span class="text-[11px] px-2 py-0.5 rounded-full bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400">
+                    nothing to buy
+                  </span>
+                )}
+              </>
+            ) : (
+              <span class="t-micro">the shelves could not be read just now</span>
+            )}
+          </span>
+          <span class="shrink-0 flex" style={{ color: 'var(--ink-3)' }}>
+            <Icon name="chev-right" className="w-4 h-4" />
+          </span>
+        </a>
+      </Card>
+      )}
+
+      {/* Meds on the home screen. The cupboard itself is its own tab now; this
+          card is the one-line answer, and it reports ONLY the two facts that
+          need a person: how many have expired and how many expire inside the
+          30-day window. No item count and no coloured all-clear — a healthy
+          cupboard says so in a single muted line (or that it could not be
+          read, which is a different fact and must not look like "empty"). */}
+      <Card title="Meds" icon="pill" className="mt-4">
+        <a href="/meds" class="flex items-center gap-2 -mb-0.5 active:scale-[0.99] transition-transform">
+          <span class="flex flex-wrap items-center gap-1.5 flex-1 min-w-0">
+            {meds ? (
+              <>
+                {meds.expired > 0 && (
+                  <span class="text-[11px] px-2 py-0.5 rounded-full font-bold bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400">
+                    {meds.expired} expired
+                  </span>
+                )}
+                {meds.soon > 0 && (
+                  <span class="text-[11px] px-2 py-0.5 rounded-full font-bold bg-orange-50 dark:bg-orange-900/20 text-orange-700 dark:text-orange-400">
+                    {meds.soon} expiring soon
+                  </span>
+                )}
+                {meds.expired === 0 && meds.soon === 0 && (
+                  <span class="t-micro">nothing expiring</span>
+                )}
+              </>
+            ) : (
+              <span class="t-micro">the cupboard could not be read just now</span>
+            )}
+          </span>
+          <span class="shrink-0 flex" style={{ color: 'var(--ink-3)' }}>
+            <Icon name="chev-right" className="w-4 h-4" />
+          </span>
+        </a>
+      </Card>
+
+      {/* Container-only: the Cloudflare build's map is the WAY tab. The card is
+          gated on the boot configuration, so the Worker never renders a link
+          to a route it does not mount. */}
+      {trackingEnabled() && (
+      <Card title="Live tracking" icon="pin" className="mt-4">
+        <a href="/track" class="flex items-center gap-2 -mb-0.5 active:scale-[0.99] transition-transform">
+          <span class="flex-1 min-w-0">
+            <span class="t-micro block">Positions from the phones, as they arrive — no refresh.</span>
+          </span>
+          <span class="shrink-0 flex" style={{ color: 'var(--ink-3)' }}>
+            <Icon name="chev-right" className="w-4 h-4" />
+          </span>
+        </a>
+      </Card>
+      )}
+    </Layout>
+  )
+})
+
+export default dashboard

@@ -1,0 +1,13 @@
+node_modules
+data
+.git
+.github
+.wrangler
+audits
+scripts/*
+# The migrator applies this by path; it must be in the image.
+!scripts/repair-way-messages-fk.sql
+*.log
+.dev.vars
+.env
+.tmp-*

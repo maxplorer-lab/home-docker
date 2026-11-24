@@ -1,0 +1,21 @@
+services:
+  home:
+    build: .
+    container_name: home-sompitra
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    volumes:
+      # Both SQLite files live here: home.sqlite + sompitra.sqlite.
+      - ./data:/data
+    environment:
+      # REQUIRED for a seamless migration: the same pepper the Cloudflare
+      # deployment used, or every imported password hash fails to verify.
+      # Leave blank only for a fresh install claimed through /bootstrap.
+      AUTH_PEPPER: "${AUTH_PEPPER:-}"
+      SESSION_SECRET: "${SESSION_SECRET:-}"
+      # Optional: push notifications still use the household ntfy server.
+      NTFY_URL: "${NTFY_URL:-}"
+      NTFY_TOKEN: "${NTFY_TOKEN:-}"
+      PBKDF2_ITERATIONS: "5000"
+      TZ: "${TZ:-Africa/Nairobi}"

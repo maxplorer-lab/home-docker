@@ -1,0 +1,42 @@
+{
+  "name": "home",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "start": "tsx server/index.mjs",
+    "migrate:sqlite": "node server/migrate.mjs",
+    "import:sql": "node server/import.mjs sql",
+    "import:csv": "node server/import.mjs csv",
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy",
+    "db:local": "node scripts/db-migrate.mjs --local",
+    "db:remote": "node scripts/db-migrate.mjs --remote",
+    "check": "tsc --noEmit",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./scripts/way-ts-hooks.mjs --test \"scripts/**/*.test.mjs\"",
+    "smoke": "node scripts/smoke.mjs",
+    "audit:remote": "node scripts/schema-audit.mjs",
+    "audit:rules": "node scripts/rule-guards-audit.mjs",
+    "audit:laoka-types": "node scripts/laoka-types-audit.mjs",
+    "audit:module-state": "node scripts/module-state-audit.mjs",
+    "audit:do-state": "node scripts/do-state-audit.mjs",
+    "audit:functions": "node scripts/function-consistency-audit.mjs",
+    "audit:client-state": "node scripts/client-state-audit.mjs",
+    "audit:basemaps": "node scripts/basemap-record-audit.mjs",
+    "basemaps:record": "node scripts/basemap-record.mjs",
+    "verify": "npm run check && npm test && npm run smoke",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.11",
+    "better-sqlite3": "^13.2.0",
+    "hono": "^4.7.11",
+    "tsx": "^4.23.15",
+    "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250901.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.42.0"
+  }
+}

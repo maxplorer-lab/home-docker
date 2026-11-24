@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live view</title>
+<!-- The one page an OUTSIDER opens. It is deliberately outside the app's
+     chrome: no header, no tabs, no manifest, no service worker, no cookie. -->
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:,">
+<!-- The app-wide typed-entry rule (/shared/number-entry.js). This page is the
+     outsider's view and has no number box; it loads the rule anyway so "no box
+     in Home is nudged" holds for every document the Worker serves. -->
+<script src="/shared/number-entry.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+  :root { --accent: #16a34a; --ink: #0f172a; --muted: #64748b; --card: #ffffff; --line: #e2e8f0; }
+  @media (prefers-color-scheme: dark) {
+    :root { --accent: #22c55e; --ink: #e2e8f0; --muted: #94a3b8; --card: #1e293b; --line: #334155; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: #eef2f6; color: var(--ink); overscroll-behavior: none;
+  }
+  #map { position: fixed; inset: 0; }
+  .frame { position: fixed; inset: 0; display: none; }
+  .frame.on { display: block; }
+
+  /* ── the chip: who, and how fresh ─────────────────────────────── */
+  .chip {
+    position: fixed; top: calc(10px + env(safe-area-inset-top)); left: 10px; z-index: 1000;
+    display: flex; align-items: center; gap: 9px; max-width: calc(100vw - 20px);
+    padding: 9px 13px; border-radius: 999px; background: color-mix(in srgb, var(--card) 88%, transparent);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid var(--line); box-shadow: 0 4px 16px rgba(15, 23, 42, .16);
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--accent); flex: 0 0 auto; position: relative; }
+  .dot.live::after {
+    content: ""; position: absolute; inset: -4px; border-radius: 50%;
+    border: 2px solid var(--accent); animation: ring 2s ease-out infinite;
+  }
+  .dot.stale { background: #f59e0b; }
+  @keyframes ring { 0% { transform: scale(.7); opacity: .9 } 100% { transform: scale(1.9); opacity: 0 } }
+  .chip b { font-size: 15px; font-weight: 700; letter-spacing: -.01em; }
+  .chip .sub { font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+  /* ── the lower badge: a HUD panel, the shape the household's own map wears.
+        Dark in BOTH themes on purpose — it sits on tiles, and the light card
+        this replaced washed out the very text it existed to carry. ────────── */
+  .hud {
+    position: fixed; left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom));
+    z-index: 1000; padding: 10px 13px; border-radius: 16px;
+    display: flex; align-items: center; gap: 12px;
+    background: rgba(10, 10, 14, .92); color: #e2e8f0;
+    border: 1px solid rgba(255, 255, 255, .12); box-shadow: 0 10px 24px rgba(0, 0, 0, .55);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  }
+  /* On anything wide enough to be a desk or a tablet it stops being a bar and
+     becomes the panel the phone map already shows, anchored left. */
+  @media (min-width: 700px) { .hud { right: auto; width: 380px; } }
+  /* The speedometer, in the household map's own readout shape: the figure large
+     enough to read at arm's length with the unit under it, coloured by the same
+     ramp the trail is drawn from. This is the one number the badge exists for,
+     so it gets the room — and it is the LIVE number, while the dot glides.
+     No webfont here: the outsider's page loads nothing it does not need, so
+     the mono stack is the system's. */
+  .hud .spd {
+    flex: 0 0 auto; min-width: 78px; text-align: center;
+    padding-right: 12px; border-right: 1px solid rgba(255, 255, 255, .1);
+  }
+  .hud .spd-num {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 38px; font-weight: 800; line-height: 1; letter-spacing: -1.5px;
+    font-variant-numeric: tabular-nums; color: #9ca3af;
+  }
+  .hud .spd-unit { font-size: 9px; color: #9ca3af; text-transform: uppercase; margin-top: 3px; letter-spacing: .6px; }
+  .hud .cols { flex: 1 1 auto; min-width: 0; }
+  .hud .addr { font-size: 12.5px; font-weight: 650; line-height: 1.35; letter-spacing: -.01em; }
+  .hud .addr .line2 { display: block; font-size: 11px; font-weight: 500; color: #94a3b8; }
+  .hud .addr.loading { color: #64748b; font-weight: 500; }
+  /* The footer WRAPS instead of truncating: on a phone this line carries the
+     state, the window, the point count and when the code dies, and an ellipsis
+     ate whichever of those did not fit — usually the one being asked about. */
+  .hud-foot {
+    display: flex; flex-wrap: wrap; gap: 3px 8px;
+    margin-top: 5px; padding-top: 5px; border-top: 1px solid rgba(255, 255, 255, .08);
+    font-size: 10px; color: #94a3b8;
+  }
+  .hud-foot span + span::before { content: "· "; color: #475569; }
+  .hud-foot .st { color: #e2e8f0; font-weight: 650; }
+  #recentre {
+    position: fixed; right: 12px; bottom: calc(106px + env(safe-area-inset-bottom)); z-index: 1000;
+    display: none; align-items: center; gap: 6px; padding: 10px 14px; border: 1px solid var(--line);
+    border-radius: 999px; background: var(--card); color: var(--ink); font-size: 13px; font-weight: 600;
+    box-shadow: 0 4px 16px rgba(15, 23, 42, .18); cursor: pointer;
+  }
+  #recentre.on { display: flex; }
+  .leaflet-control-attribution { font-size: 10px; }
+
+  /* ── the gate: type the pin ───────────────────────────────────── */
+  #gate {
+    position: fixed; inset: 0; z-index: 2000; display: flex; align-items: center; justify-content: center;
+    padding: 24px; background: linear-gradient(180deg, #f8fafc, #e2e8f0);
+  }
+  @media (prefers-color-scheme: dark) { #gate { background: linear-gradient(180deg, #0f172a, #1e293b); } }
+  #gate.off { display: none; }
+  .card {
+    width: 100%; max-width: 340px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 20px; padding: 24px; box-shadow: 0 12px 40px rgba(15, 23, 42, .18); text-align: center;
+  }
+  .brand { display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 4px; }
+  .brand span { font-size: 18px; font-weight: 800; letter-spacing: -.02em; color: var(--accent); }
+  .card h1 { font-size: 17px; margin: 6px 0 2px; }
+  .card p { margin: 0 0 16px; font-size: 13px; color: var(--muted); }
+  #pin {
+    width: 100%; padding: 15px 12px; font-size: 30px; font-weight: 700; letter-spacing: .34em;
+    text-align: center; text-indent: .34em; border-radius: 14px; border: 2px solid var(--line);
+    background: transparent; color: var(--ink); font-variant-numeric: tabular-nums;
+  }
+  #pin:focus { outline: none; border-color: var(--accent); }
+  button.go {
+    width: 100%; margin-top: 12px; padding: 14px; font-size: 15px; font-weight: 700; color: #fff;
+    background: var(--accent); border: 0; border-radius: 14px; cursor: pointer;
+  }
+  button.go:disabled { opacity: .6; cursor: default; }
+  #err { margin-top: 12px; font-size: 13px; color: #dc2626; min-height: 18px; }
+  @media (prefers-color-scheme: dark) { #err { color: #f87171; } }
+</style>
+</head>
+<body>
+
+<!-- The gate. It is the whole page until a pin resolves, and it says nothing
+     about the household — not the names, not how many devices there are. -->
+<div id="gate">
+  <div class="card">
+    <div class="brand"><span>Home</span></div>
+    <h1>Live view</h1>
+    <p id="gate-sub">Enter the 6-digit code you were given.</p>
+    <input id="pin" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*"
+           maxlength="6" placeholder="••••••" aria-label="6-digit code">
+    <button class="go" id="go">Watch</button>
+    <div id="err" role="alert"></div>
+  </div>
+</div>
+
+<div class="frame" id="frame">
+  <div id="map"></div>
+  <div class="chip" id="chip">
+    <span class="dot" id="dot"></span>
+    <span><b id="who">—</b><br><span class="sub" id="when">connecting…</span></span>
+  </div>
+  <button id="recentre">◎ Recentre</button>
+  <!-- The lower badge: a speedometer, then WHERE the device is
+       (reverse-geocoded, refreshed on its own clock), then one wrapping line of
+       state. All of it sits outside the map's own attribution, which stays
+       where Leaflet puts it. -->
+  <div class="hud" id="hud">
+    <div class="spd">
+      <div class="spd-num" id="spd">--</div>
+      <div class="spd-unit">km/h</div>
+    </div>
+    <div class="cols">
+      <div class="addr loading" id="addr">Locating…</div>
+      <div class="hud-foot" id="foot"></div>
+    </div>
+  </div>
+</div>
+
+<!-- The fluid cursor and the follow camera, the SAME module the household's own
+     map loads: the share draws what that map draws, so there is nothing to keep
+     in step by hand. -->
+<script src="/shared/playback.js"></script>
+<!-- The basemaps, shared with the household's map — and the reason this page
+     does NOT name a tile server of its own: the hardcoded OSM URL that used to
+     sit below is what got this app blocked (2026-09-20). -->
+<script src="/shared/basemaps.js"></script>
+<script src="/shared/basemap-style.js"></script>
+<script src="/shared/basemap-layer.js"></script>
+<!-- The geometry, ALSO shared with the household's map: this page used to carry
+     its own haversine (distanceM), the same law written a second way — one in the
+     asin form here, one in the atan2 form there. A share that measures
+     differently from the map is a second opinion about the same road. -->
+<script src="/shared/geo.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- The vector half of the one background: MapLibre draws the style, the
+     wrapper draws it as a Leaflet layer so the trail, the cursor and the
+     marker stay Leaflet layers. Same pins as the household map's page. -->
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.22/leaflet-maplibre-gl.js"></script>
+<script>
+(function () {
+  'use strict';
+  // The pin lives in this tab's sessionStorage so a reload does not ask a
+  // grandparent to retype it — and dies with the tab, never survives as a
+  // bookmark, and is never written to the URL we keep (see boot()).
+  var PIN_KEY = 'live_pin';
+  var POLL_MS = 5000;
+  var STALE_MS = 120000;   // "live" stops claiming to be live after 2 min
+  // The zoom this page OPENS at and RETURNS to. 14 put the device in a
+  // neighbourhood blob; the question an outsider is holding this page to answer
+  // is "which street is she on", and that is a 17. It is deliberately NOT the
+  // household map's own follow zoom (16, a per-person preference there): this
+  // is one page with one job, and nothing here should have to be configured.
+  var FOLLOW_ZOOM = 17;
+  var map = null, marker = null, line = null, timer = null, following = true, watchOn = false;
+  // The fluid clock and the camera come from the shared module (the same code
+  // the household map runs). This view is FLUID ONLY -- there is no pace switch
+  // here: a viewer asking "is she nearly here" wants the movement of a commute,
+  // not a dot snapping every five seconds, and the live numbers (speed, "16s
+  // ago") are in the badge either way.
+  var FLUID = window.HomePlayback.FLUID;
+  var followDriver = null;              // built with the map, below
+  var points = [];                      // this share's windowed fixes, by timestamp
+  var cursor = null;                    // {lat,lng} -- where the marker is DRAWN
+  var tailAt = null;                    // where the drawn line currently ends
+  var rafId = null, lastFrameMs = 0;
+
+  function $(id) { return document.getElementById(id); }
+  function fail(msg) { $('err').textContent = msg; }
+
+  var MESSAGES = {
+    bad_pin: 'That code is not right. Check the six digits and try again.',
+    expired: 'This link ended at midnight UTC. Ask for a new code.',
+    revoked: 'This link was switched off. Ask for a new code.',
+    rate_limited: 'Too many attempts from this device. Try again in an hour.',
+    unavailable: 'The map cannot be reached right now. Retrying…'
+  };
+
+  function boot() {
+    // A link may carry the pin in the fragment (#123456): the fragment never
+    // reaches a server, so it stays out of access logs and Referer headers.
+    // A ?pin= query works too, and is stripped from the address bar at once.
+    var fromHash = (location.hash || '').replace(/^#/, '').trim();
+    var qs = new URLSearchParams(location.search);
+    var fromQuery = (qs.get('pin') || '').trim();
+    if (fromHash && /^[0-9]{6}$/.test(fromHash)) { $('pin').value = fromHash; }
+    else if (fromQuery && /^[0-9]{6}$/.test(fromQuery)) { $('pin').value = fromQuery; }
+    else {
+      var saved = sessionStorage.getItem(PIN_KEY);
+      if (saved && /^[0-9]{6}$/.test(saved)) { $('pin').value = saved; }
+    }
+    if (location.hash || qs.has('pin')) {
+      history.replaceState(null, '', location.pathname);
+    }
+    if ($('pin').value.length === 6) { submit(); }
+    else { $('pin').focus(); }
+  }
+
+  function submit() {
+    var pin = ($('pin').value || '').replace(/[^0-9]/g, '').slice(0, 6);
+    $('pin').value = pin;
+    if (pin.length !== 6) { fail('The code is six digits.'); return; }
+    $('go').disabled = true;
+    fetchState(pin).then(function (res) {
+      $('go').disabled = false;
+      if (!res || !res.ok) {
+        var code = (res && res.body && res.body.code) || 'unavailable';
+        fail(MESSAGES[code] || MESSAGES.unavailable);
+        if (code === 'rate_limited') return;      // do not keep hammering
+        return;
+      }
+      sessionStorage.setItem(PIN_KEY, pin);
+      show(res.body);
+    });
+  }
+
+  function fetchState(pin) {
+    return fetch('/live/api/state?pin=' + encodeURIComponent(pin), { cache: 'no-store' })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, status: r.status, body: b }; }); })
+      .catch(function () { return { ok: false, status: 0, body: { code: 'unavailable' } }; });
+  }
+
+  function show(state) {
+    $('gate').classList.add('off');
+    $('frame').classList.add('on');
+    $('who').textContent = state.label || 'Device';
+    render(state);
+    if (!timer) timer = setInterval(poll, POLL_MS);
+    // A stale tab that comes back should not sit on a five-minute-old dot.
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+  }
+
+  function poll() {
+    var pin = sessionStorage.getItem(PIN_KEY);
+    if (!pin) return;
+    fetchState(pin).then(function (res) {
+      if (res && res.ok) { render(res.body); return; }
+      var code = (res && res.body && res.body.code) || 'unavailable';
+      if (code === 'expired' || code === 'revoked' || code === 'bad_pin') {
+        clearInterval(timer); timer = null;
+        // Forget it. A dead code kept in sessionStorage would be re-submitted
+        // by the next visit and sit in the box looking like a typo, when the
+        // page's own sentence says to ask for a new one.
+        sessionStorage.removeItem(PIN_KEY);
+        $('pin').value = '';
+        gateOpen(MESSAGES[code] || MESSAGES.unavailable);
+        return;
+      }
+      $('when').textContent = 'reconnecting…';
+    });
+  }
+
+  function gateOpen(msg) {
+    $('frame').classList.remove('on');
+    $('gate').classList.remove('off');
+    fail(msg);
+  }
+
+  // ── the address ──────────────────────────────────────────────────
+  // What the household's own map shows, asked the polite way: at most one
+  // request every ADDRESS_MS, and none while the device sits where we already
+  // resolved it. "Every 10 s" is about a MOVING car; a parked one that kept
+  // asking would be six requests a minute for an answer we already hold.
+  var ADDRESS_MS = 10000;
+  // Past this drift the text we hold no longer describes where the device is,
+  // and a stale address is worse than a dash because it looks authoritative.
+  var ADDRESS_MAX_AGE_M = 400;
+  var address = null;   // { lat, lon, at, lines: [primary, secondary] }
+
+  // One line on purpose: the geometry is HomeGeo's (/shared/geo.js), so this page
+  // and the household's map cannot answer "how far" differently.
+  function distanceM(lat1, lon1, lat2, lon2) {
+    return HomeGeo.distanceMeters(lat1, lon1, lat2, lon2);
+  }
+
+  // Nominatim's address object -> two lines: the street (with its number when
+  // OpenStreetMap has one), then the suburb and the first division. Each line
+  // takes the next DISTINCT value, so where OSM has no street names the same
+  // word cannot print twice. Same rule the household's map uses.
+  function describeAddress(addr) {
+    function pick(keys) {
+      for (var i = 0; i < keys.length; i++) { if (addr[keys[i]]) return String(addr[keys[i]]); }
+      return '';
+    }
+    var street = pick(['road', 'pedestrian', 'footway', 'residential', 'lane', 'path']);
+    var house = pick(['house_number']);
+    var candidates = [
+      street ? ((house ? house + ' ' : '') + street) : '',
+      pick(['suburb', 'neighbourhood', 'quarter', 'hamlet']),
+      pick(['municipality', 'city', 'town', 'village']),
+      pick(['county', 'state_district', 'state', 'region'])
+    ];
+    var seen = {}, lines = [];
+    for (var i = 0; i < candidates.length && lines.length < 3; i++) {
+      if (!candidates[i] || seen[candidates[i]]) continue;
+      seen[candidates[i]] = true;
+      lines.push(candidates[i]);
+    }
+    return [lines[0] || '', lines[1] || '', lines[2] || ''];
+  }
+
+  function maybeResolveAddress(state) {
+    if (typeof L === 'undefined' || state.lat === null || state.lng === null) return;
+    var now = Date.now();
+    if (address && distanceM(address.lat, address.lon, state.lat, state.lng) > ADDRESS_MAX_AGE_M) address = null;
+    var parkedHere = state.stationary === true &&
+      address && distanceM(address.lat, address.lon, state.lat, state.lng) < 150;
+    if (parkedHere) return;
+    if (address && address.at && now - address.at < ADDRESS_MS) return;
+    // Stamped BEFORE the request resolves, which is what actually throttles it.
+    address = { lat: state.lat, lon: state.lng, at: now, lines: address ? address.lines : null };
+    fetch('https://nominatim.openstreetmap.org/reverse?lat=' + state.lat + '&lon=' + state.lng +
+      '&format=jsonv2&zoom=18&addressdetails=1')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) { if (data && data.address && address) address.lines = describeAddress(data.address); })
+      .catch(function () {});
+  }
+
+  function renderAddress() {
+    var el = $('addr');
+    var lines = address && address.lines;
+    el.textContent = '';
+    if (!lines || !lines[0]) {
+      el.className = 'addr loading';
+      el.textContent = '—';
+      return;
+    }
+    el.className = 'addr';
+    var first = document.createElement('span');
+    first.textContent = lines[0];
+    el.appendChild(first);
+    var rest = [lines[1], lines[2]].filter(function (v) { return !!v; }).join(' · ');
+    if (rest) {
+      var second = document.createElement('span');
+      second.className = 'line2';
+      second.textContent = rest;
+      el.appendChild(second);
+    }
+  }
+
+  function clock(iso) {
+    try { return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+    catch (e) { return ''; }
+  }
+
+  function ago(ms) {
+    var s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return 'live · ' + s + 's ago';
+    var m = Math.round(s / 60);
+    if (m < 60) return 'last seen ' + m + ' min ago';
+    return 'last seen ' + Math.round(m / 60) + ' h ago';
+  }
+
+  /** The footer's parts as SEPARATE spans, so the line wraps on a phone
+   * instead of ellipsising away whichever fact did not fit — and so no
+   * separator is ever left dangling at the end of a wrapped line. */
+  function setFoot(bits) {
+    var el = $('foot');
+    el.textContent = '';
+    for (var i = 0; i < bits.length; i++) {
+      var s = document.createElement('span');
+      s.textContent = bits[i].text;
+      if (bits[i].cls) s.className = bits[i].cls;
+      el.appendChild(s);
+    }
+  }
+
+  function render(state) {
+    // The map library is this page's only third-party dependency, and the viewer
+    // is the one person in the product we cannot support in person: if it did
+    // not load, a blank rectangle would be the whole answer. Say the true thing
+    // instead, and keep saying it — `poll` calls this again every few seconds.
+    if (typeof L === 'undefined') {
+      $('foot').textContent = 'Could not load the map. Check the connection and reload this page.';
+      return;
+    }
+    var stale = state.ageMs === null || state.ageMs > STALE_MS;
+    $('dot').className = 'dot' + (stale ? ' stale' : ' live');
+    $('when').textContent = state.updatedAt ? ago(state.ageMs || 0) : 'hasn’t reported yet';
+
+    // The speedometer takes the LIVE number — the newest fix's, straight out of
+    // the payload — while the dot on the map glides behind it. The colour is the
+    // household map's own ramp, read from the shared module so the two readouts
+    // cannot drift apart. "--" is a real answer: no signal yet.
+    var kmh = (state.speed === null || state.speed < 0) ? null : Math.round(state.speed);
+    var spdEl = $('spd');
+    spdEl.textContent = kmh === null ? '--' : String(kmh);
+    // Looked up rather than called blind: an OUTSIDER's browser can hold the
+    // motion engine one deploy behind this document (found exactly that in the
+    // preview pane), and an unqualified call would throw HERE — leaving the dial
+    // grey and every line BELOW it, the address and the window included, never
+    // written. The fallback is the dial's own neutral colour, deliberately not a
+    // second copy of the ramp: this page must not know the stops.
+    var rampColor = (window.HomePlayback && typeof HomePlayback.speedColor === 'function')
+      ? HomePlayback.speedColor : null;
+    if (kmh === null) spdEl.style.color = '#9ca3af';
+    else if (rampColor) spdEl.style.color = rampColor(kmh);
+
+    var bits = [];
+    // The state word, not the speed: the figure is already in the dial beside it.
+    if (state.place) bits.push({ text: 'at ' + state.place, cls: 'st' });
+    else if (state.driving) bits.push({ text: 'driving', cls: 'st' });
+    else if (state.stationary) bits.push({ text: 'stopped' });
+    if (state.trackTotal) {
+      // The window is the GRANT, not the day: say which, and when it started.
+      // NOT named `window`: a `var` is hoisted to the top of render(), so a
+      // local by that name makes the global read undefined for the WHOLE
+      // function — which silently killed every line after the speed figure
+      // (found live: the dial stayed grey and the footer stayed empty).
+      var windowLabel = state.since ? 'since ' + clock(state.since) : 'today';
+      var n = state.trackTotal;
+      bits.push({ text: windowLabel });
+      bits.push({ text: n + (n === 1 ? ' point' : ' points') +
+        (state.track.length !== n ? ' (showing ' + state.track.length + ')' : '') });
+    }
+    maybeResolveAddress(state);
+    renderAddress();
+    var ends = state.expiresAt ? new Date(state.expiresAt) : null;
+    if (ends) {
+      var hh = String(ends.getUTCHours()).padStart(2, '0');
+      bits.push({ text: 'code ends ' + hh + ':00 UTC' });
+    }
+    setFoot(bits);
+
+    if (state.lat === null || state.lng === null) return;
+
+    mergeFixes(state);
+
+    var at = [state.lat, state.lng];
+    if (!map) {
+      map = L.map('map', { zoomControl: true, attributionControl: true });
+      // One background and no switch: this view has no layer menu, no
+      // satellite, no hillshade. The household's map is the one with a choice
+      // to make; an outsider gets the map that always works — the labelled
+      // background, drawn by the SAME call the household map makes
+      // (/shared/basemap-layer.js), so what the two draw cannot drift apart and
+      // no tile host is named in this file. A host named here is how /live ended
+      // up asking OpenStreetMap's donated hardware for tiles until it blocked
+      // the app (see /shared/basemaps.js), and the fix is not "a nicer URL": it
+      // is having no URL of our own to get wrong. `HomeBasemaps.streets` is the
+      // key by name, and smoke §9 asserts it is this one.
+      if (window.HomeBasemapLayer && window.HomeBasemaps && window.HomeBasemaps.streets) {
+        HomeBasemapLayer.show('streets', map);
+      } else {
+        // The modules are separate requests, so one can fail on its own — and a
+        // silent grey square reads as "she has not moved". The footer cannot
+        // carry this: it is rebuilt from live state on every poll. `npm run
+        // smoke` asserts the modules are actually served, which is the check
+        // that catches the real cause (a missing asset), so this is for the
+        // person holding the phone when that happens.
+        console.error('HomeBasemapLayer or HomeBasemaps is missing: /shared/{basemaps,basemap-layer}.js did not load, so the map has no background');
+      }
+      // The device starts in the MIDDLE of the screen, which is the position
+      // the camera's cycle assumes at its start.
+      map.setView(at, FOLLOW_ZOOM);
+      cursor = { lat: state.lat, lng: state.lng };
+      line = L.polyline([], { color: '#16a34a', weight: 4, opacity: .55, lineJoin: 'round' }).addTo(map);
+      marker = L.circleMarker(at, {
+        radius: 9, color: '#ffffff', weight: 3, fillColor: '#16a34a', fillOpacity: 1
+      }).addTo(map);
+      followDriver = HomePlayback.createFollowCamera({ L: L, getMap: function () { return map; } });
+      // Following is the default and it stops the moment the viewer takes the
+      // map themselves — nothing is more annoying than a map that keeps
+      // yanking itself back while someone is looking around.
+      map.on('dragstart', function () { following = false; $('recentre').classList.add('on'); });
+      $('recentre').addEventListener('click', function () {
+        following = true; $('recentre').classList.remove('on');
+        if (map && cursor) {
+          followDriver.notifyPlaced(Date.now());
+          // Back to the follow view exactly: Recentre means "show me the device
+          // the way this page shows it", not "whatever zoom I last pinched to".
+          map.setView([cursor.lat, cursor.lng], FOLLOW_ZOOM);
+        }
+      });
+      startFrames();
+    }
+    marker.setStyle({ fillColor: stale ? '#f59e0b' : '#16a34a' });
+  }
+
+  /** Fold one payload's fixes into the list the cursor is drawn from.
+   *
+   * The track is this share's own window (creation to revoke) -- all the viewer
+   * is allowed -- plus the live fix, which can be NEWER than the last drawn
+   * point (a device parked inside a fence pings without leaving a track point at
+   * all). Deduped by timestamp and sorted, because the cursor binary-searches
+   * this list on every frame. */
+  function mergeFixes(state) {
+    var add = [];
+    if (state.track && state.track.length) {
+      for (var i = 0; i < state.track.length; i++) {
+        add.push({ latitude: state.track[i][0], longitude: state.track[i][1], timestamp: state.track[i][2] });
+      }
+    }
+    if (state.updatedAt) add.push({ latitude: state.lat, longitude: state.lng, timestamp: state.updatedAt });
+    if (!add.length) return;
+    var seen = {}, grew = false, j;
+    for (j = 0; j < points.length; j++) seen[points[j].timestamp] = true;
+    for (j = 0; j < add.length; j++) {
+      if (seen[add[j].timestamp]) continue;
+      seen[add[j].timestamp] = true;
+      points.push(add[j]);
+      grew = true;
+    }
+    if (grew) points.sort(function (a, b) { return new Date(a.timestamp) - new Date(b.timestamp); });
+  }
+
+  // ── the fluid frame ───────────────────────────────────────────────
+  // One animation frame owns everything that moves: the marker glides along the
+  // cursor HomePlayback computes (25s behind live, interpolated between fixes),
+  // the trail is redrawn once the cursor has really moved, and the camera runs
+  // its drift -> push -> sweep cycle. The HOUSEHOLD map runs this same code on
+  // this same module, which is what "the share looks exactly like the map"
+  // means here -- not two implementations that agree today.
+  //
+  // The badge above stays LIVE while this is delayed: the speed and the "16s
+  // ago" are the newest fix, read straight out of the payload. The delay lives
+  // in where the dot is drawn, never in what it says.
+  function startFrames() {
+    if (rafId !== null) return;
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function frame(nowMs) {
+    rafId = requestAnimationFrame(frame);
+    var dtSec = lastFrameMs ? Math.min((nowMs - lastFrameMs) / 1000, 0.5) : 0;
+    lastFrameMs = nowMs;
+
+    var pos = HomePlayback.cursorPosition(points, Date.now() - FLUID.LAG_SECONDS * 1000);
+    if (pos) {
+      var k = HomePlayback.easeFactor(FLUID.EASE_PER_SECOND, dtSec);
+      cursor = {
+        lat: cursor ? cursor.lat + (pos.lat - cursor.lat) * k : pos.lat,
+        lng: cursor ? cursor.lng + (pos.lng - cursor.lng) * k : pos.lng
+      };
+      drawTail(pos);
+      if (following) followDriver.update(nowMs, cursor);
+    }
+    if (marker && cursor) marker.setLatLng([cursor.lat, cursor.lng]);
+  }
+
+  /** The drawn line ends where the MARKER is, never past it: a trail that runs
+   * ahead of its own dot is two stories on one screen. Up to the cursor, plus
+   * the segment that reaches it, redrawn only once the cursor moved a metre or
+   * so -- rebuilding a polyline every frame buys motion nobody can see. */
+  function drawTail(pos) {
+    if (!line || !cursor) return;
+    if (tailAt && distanceM(tailAt.lat, tailAt.lng, cursor.lat, cursor.lng) < FLUID.TAIL_MIN_METERS) return;
+    var upto = [];
+    for (var i = 0; i <= pos.idx && i < points.length; i++) {
+      upto.push([points[i].latitude, points[i].longitude]);
+    }
+    upto.push([cursor.lat, cursor.lng]);
+    line.setLatLngs(upto);
+    tailAt = { lat: cursor.lat, lng: cursor.lng };
+  }
+
+  $('go').addEventListener('click', submit);
+  $('pin').addEventListener('input', function () {
+    this.value = this.value.replace(/[^0-9]/g, '').slice(0, 6);
+    if (this.value.length === 6) submit();
+  });
+  $('pin').addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
+  boot();
+})();
+</script>
+</body>
+</html>

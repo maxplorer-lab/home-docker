@@ -1,0 +1,2833 @@
+/** @jsxImportSource hono/jsx */
+import { Hono } from 'hono'
+import { Layout, Card } from '../views/layout'
+import { requireAuth } from '../lib/middleware'
+import { mga, formatDate, generateId, currentWeekBounds, currentMonthBounds, monthKeyOf, monthBounds, shiftMonthKey, localDate, addDays, userAccentColor } from '../lib/utils'
+// Envelope accounting lives in one place: funding is a move, spending is a
+// purchase, and no row may be counted as both.
+import { REAL_SPEND_SQL, envelopeBalances } from '../lib/envelope'
+// The brand glyph set (see app-chrome.tsx) — money screens use the money icons.
+import { Icon } from '../views/app-chrome'
+import { notifyTransaction } from '../lib/notify'
+// A batch is a category, a name and a list of priced lines; saving writes one
+// transaction per batch. The reader is a plain module so its tests exercise the
+// same copy this route runs.
+import { legacyItemizedBatch, readExpenseBatches, type ExpenseBatch } from '../lib/expense-batches'
+import type { Env, User, Transaction, CategoryGroup, Category, IncomeAccount } from '../db/schema'
+
+const budget = new Hono<{ Bindings: Env; Variables: { user: User } }>()
+budget.use('*', requireAuth)
+
+// ─── Helper: get categories with group names ──────────────────
+async function getCategories(db: D1Database) {
+  return db.prepare(
+    `SELECT c.*, cg.name AS group_name FROM categories c
+     JOIN category_groups cg ON c.group_id = cg.id
+     ORDER BY cg.sort_order, c.sort_order`
+  ).all<Category>()
+}
+
+// ─── Report helpers ──────────────────────────────────────────
+function reportPeriod(key: string): { start: string; end: string; label: string } {
+  const today = localDate()
+  switch (key) {
+    case 'last_week': {
+      const { start, end } = currentWeekBounds(-1)
+      return { start, end, label: 'Last Week (SAT–FRI)' }
+    }
+    case 'last_7_days':
+      return { start: addDays(today, -6), end: today, label: 'Last 7 Days' }
+    case 'this_month': {
+      const { start, end } = currentMonthBounds(0)
+      return { start, end, label: 'This Month' }
+    }
+    case 'last_month': {
+      const { start, end } = currentMonthBounds(-1)
+      return { start, end, label: 'Last Month' }
+    }
+    case 'last_30_days':
+      return { start: addDays(today, -29), end: today, label: 'Last 30 Days' }
+    case 'this_year':
+      return { start: `${today.slice(0, 4)}-01-01`, end: today, label: 'This Year' }
+    case 'all': {
+      return { start: '1970-01-01', end: '2999-12-31', label: 'All Time' }
+    }
+    default: {
+      const { start, end } = currentWeekBounds(0)
+      return { start, end, label: 'This Week (SAT–FRI)' }
+    }
+  }
+}
+
+async function getTrend(db: D1Database, start: string, end: string, periodKey: string) {
+  // Granularity follows the SPAN, not the period's name. A week is read day by
+  // day; a month is read in SAT–FRI weeks, because thirty daily bars in one
+  // card answer nothing at a glance — and the same rule covers a custom range
+  // of a few weeks. A year (or longer) is read by month at the other end.
+  const spanDays = Math.round((Date.parse(end) - Date.parse(start)) / 86_400_000) + 1
+  const granularity: 'day' | 'week' | 'month' =
+    periodKey === 'this_year' || periodKey === 'all' || spanDays > 120 ? 'month'
+      : spanDays > 14 ? 'week' : 'day'
+  // The Saturday that OPENS the SAT–FRI week: step back six days, then forward
+  // to the next Saturday (which stays put when the date already is one).
+  // A monthly bar is a HOUSEHOLD month too: 24th → 23rd, keyed by the month it
+  // ends in, so the chart and the figure above it count the same days.
+  const bucket = granularity === 'month'
+    ? "CASE WHEN CAST(strftime('%d', t.date) AS INTEGER) >= 24 THEN substr(date(t.date, 'start of month', '+1 month'), 1, 7) ELSE substr(t.date, 1, 7) END"
+    : granularity === 'week' ? "date(t.date, '-6 days', 'weekday 6')"
+      : 't.date'
+  const rows = await db.prepare(
+    `SELECT ${bucket} AS bucket,
+       COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE 0 END),0) AS income,
+       COALESCE(SUM(CASE WHEN t.type='expense' AND t.is_envelope_transfer=0 THEN t.amount ELSE 0 END),0) AS expense
+     FROM transactions t
+     WHERE t.date BETWEEN ? AND ?
+     GROUP BY ${bucket}
+     ORDER BY bucket`
+  ).bind(start, end).all<{ bucket: string; income: number; expense: number }>()
+  return {
+    granularity,
+    rows: rows.results.map(r => {
+      // A month's first and last weeks are partial: they begin before the
+      // period, so the label is the period's own start rather than a date the
+      // report does not cover.
+      const labelDate = granularity !== 'month' && r.bucket < start ? start : r.bucket
+      return {
+        bucket: granularity === 'month'
+          ? `${labelDate.slice(5)}/${labelDate.slice(0, 4)}`
+          : `${labelDate.slice(5)}/${labelDate.slice(2, 4)}`,
+        income: r.income,
+        expense: r.expense,
+      }
+    }),
+  }
+}
+
+// Delete a debt/credit and every transaction linked to it (initial + installments).
+async function deleteDebtTxns(db: D1Database, accountId: string) {
+  const account = await db.prepare(
+    'SELECT synced_transaction_id FROM debt_credit_accounts WHERE id = ?'
+  ).bind(accountId).first<{ synced_transaction_id: string | null }>()
+  const txns: string[] = []
+  if (account?.synced_transaction_id) txns.push(account.synced_transaction_id)
+  const payments = await db.prepare(
+    'SELECT synced_transaction_id FROM debt_credit_payments WHERE account_id = ? AND synced_transaction_id IS NOT NULL'
+  ).bind(accountId).all<{ synced_transaction_id: string }>()
+  for (const p of payments.results) txns.push(p.synced_transaction_id)
+  for (const t of txns) await db.prepare('DELETE FROM transactions WHERE id = ?').bind(t).run()
+  await db.prepare('DELETE FROM debt_credit_accounts WHERE id = ?').bind(accountId).run()
+}
+
+// ─── GET /budget ──────────────────────────────────────────────
+budget.get('/', async (c) => {
+  const user = c.get('user')
+  const weekOffset = parseInt(c.req.query('w') || '0') || 0
+  const { start, end } = currentWeekBounds(weekOffset)
+  const weekLabel = `${formatDate(start)} – ${formatDate(end)}`
+  // Budget Progress is a MONTHLY card: `target_budget` has always meant "per
+  // month" (0001), and comparing it with one week's spending made every bar
+  // read ~25% at mid-month no matter how the month was going.
+  const month = currentMonthBounds(0)
+
+  const [txns, groups, categories] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT t.*, c.name AS category_name, cg.name AS group_name,
+              ia.name AS income_account_name, u.display_name AS added_by_display_name
+       FROM transactions t
+       LEFT JOIN categories c ON t.category_id = c.id
+       LEFT JOIN category_groups cg ON c.group_id = cg.id
+       LEFT JOIN income_accounts ia ON t.income_account_id = ia.id
+       LEFT JOIN users u ON t.added_by_user_id = u.id
+       WHERE t.date BETWEEN ? AND ?
+       ORDER BY t.date DESC, t.created_at DESC`
+    ).bind(start, end).all<Transaction>(),
+
+    c.env.DB.prepare('SELECT * FROM category_groups ORDER BY sort_order').all<CategoryGroup>(),
+    getCategories(c.env.DB),
+  ])
+
+  // Spending by group for progress bars
+  const spendingByGroup = await c.env.DB.prepare(
+    `SELECT cg.id, cg.name, COALESCE(SUM(t.amount),0) AS spent,
+            COALESCE(SUM(c.target_budget),0) AS budget
+     FROM category_groups cg
+     LEFT JOIN categories c ON c.group_id = cg.id
+     LEFT JOIN transactions t ON t.category_id = c.id AND ${REAL_SPEND_SQL} AND t.date BETWEEN ? AND ?
+     GROUP BY cg.id ORDER BY cg.sort_order`
+  ).bind(start, end).all<{ id: string; name: string; spent: number; budget: number }>()
+
+  // Spending for the Budget Progress card: one row per CATEGORY that has a
+  // target set. The card used to list GROUPS and sum their categories' targets,
+  // which both repeated money already shown in "Expenses by Category" and gave
+  // every group a bar whether or not anyone had budgeted for it. A category
+  // with no target is not progress against anything, so it is left out here
+  // (the donut above still shows its spending).
+  const [spendingByCategory, envelopeByCategory] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT c.id, c.name, COALESCE(SUM(t.amount),0) AS spent,
+              c.target_budget AS budget, c.envelope_from
+       FROM categories c
+       JOIN category_groups cg ON c.group_id = cg.id
+       LEFT JOIN transactions t ON t.category_id = c.id AND ${REAL_SPEND_SQL} AND t.date BETWEEN ? AND ?
+       WHERE c.target_budget > 0
+       GROUP BY c.id
+       ORDER BY cg.sort_order, c.sort_order`
+    ).bind(month.start, month.end).all<{ id: string; name: string; spent: number; budget: number; envelope_from: string | null }>(),
+    // Month-scoped: the card is read against one month's budget, so "funded"
+    // means funded THIS month, with last month's leftover shown as carried in.
+    envelopeBalances(c.env.DB, month),
+  ])
+
+  // Income by source for chart
+  const incomeBySource = await c.env.DB.prepare(
+    `SELECT ia.name, COALESCE(SUM(t.amount),0) AS total
+     FROM transactions t
+     JOIN income_accounts ia ON t.income_account_id = ia.id
+     WHERE t.type='income' AND t.date BETWEEN ? AND ?
+     GROUP BY ia.id ORDER BY total DESC`
+  ).bind(start, end).all<{ name: string; total: number }>()
+
+  const totalIncome   = txns.results.filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0)
+  // Funding an envelope is not spending — it is the same money moved into
+  // another pot, so it is reported on its own line instead of inflating Out.
+  const totalExpenses = txns.results.filter(t => t.type === 'expense' && !t.is_envelope_transfer).reduce((s, t) => s + t.amount, 0)
+  const totalSetAside = txns.results.filter(t => t.is_envelope_transfer === 1).reduce((s, t) => s + t.amount, 0)
+  const net           = totalIncome - totalExpenses
+
+  return c.html(
+    <Layout title="Budget" user={user} activeTab="budget">
+
+      {/* Sub-nav */}
+      <div class="flex gap-1 mb-4 bg-gray-100 dark:bg-gray-800 rounded-xl p-1">
+        <a href="/budget" class="flex flex-1 items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-semibold bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white"><Icon name="list" className="w-[15px] h-[15px]" />Overview</a>
+        <a href="/budget/reports" class="flex flex-1 items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium text-gray-500 dark:text-gray-400"><Icon name="trend" className="w-[15px] h-[15px]" />Reports</a>
+        <a href="/budget/transactions" class="flex flex-1 items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium text-gray-500 dark:text-gray-400"><Icon name="clock" className="w-[15px] h-[15px]" />History</a>
+      </div>
+
+      {/* Primary actions (most used) */}
+      <div class="flex gap-2 mb-4">
+        <a href="/budget/add-expense" class="flex-1 text-center py-3 rounded-xl bg-red-600 hover:bg-red-700 text-white text-sm font-semibold shadow-sm">+ Add Expense</a>
+        <a href="/budget/add-income" class="flex-1 text-center py-3 rounded-xl bg-green-600 hover:bg-green-700 text-white text-sm font-semibold shadow-sm">+ Add Income</a>
+        <a href={`/budget/export?w=${weekOffset}`} class="flex items-center gap-1.5 px-4 py-3 rounded-xl bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300 text-sm font-semibold"><Icon name="arrow-in" className="w-[15px] h-[15px]" />CSV</a>
+      </div>
+
+      {/* Week navigator */}
+      <div class="flex items-center justify-between mb-4">
+        <a href={`/budget?w=${weekOffset - 1}`} class="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm hover:bg-gray-50"><Icon name="chev-left" className="w-[13px] h-[13px]" />Prev</a>
+        <span class="flex items-center gap-1.5 text-sm font-semibold text-gray-600 dark:text-gray-300">
+          <Icon name="calendar" className="w-[15px] h-[15px] text-gray-400" />{weekLabel}
+        </span>
+        <a href={`/budget?w=${weekOffset + 1}`} class="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm hover:bg-gray-50">Next<Icon name="chev-right" className="w-[13px] h-[13px]" /></a>
+      </div>
+
+      {/* Summary — the same palette as the dashboard's tiles, so the same
+          three numbers do not change colour between the two screens:
+          green = money in, red = money out, teal = net (Sompitra's own hue). */}
+      <div class="grid grid-cols-3 gap-2 mb-4">
+        <div class="bg-green-50 dark:bg-green-900/20 rounded-2xl p-3 text-center border border-green-100 dark:border-green-800">
+          <p class="text-[12px] text-green-700 dark:text-green-400 font-semibold">Income</p>
+          <p class="num text-base sm:text-xl font-bold text-green-700 dark:text-green-400 truncate">{mga(totalIncome)}</p>
+        </div>
+        <div class="bg-red-50 dark:bg-red-900/20 rounded-2xl p-3 text-center border border-red-100 dark:border-red-800">
+          <p class="text-[12px] text-red-700 dark:text-red-400 font-semibold">Expenses</p>
+          <p class="num text-base sm:text-xl font-bold text-red-700 dark:text-red-400 truncate">{mga(totalExpenses)}</p>
+        </div>
+        <div class={`rounded-2xl p-3 text-center border ${net >= 0 ? 'bg-teal-50 dark:bg-teal-900/20 border-teal-100 dark:border-teal-800' : 'bg-orange-50 dark:bg-orange-900/20 border-orange-100 dark:border-orange-800'}`}>
+          <p class={`text-[12px] font-semibold ${net >= 0 ? 'text-teal-700 dark:text-teal-400' : 'text-orange-700 dark:text-orange-400'}`}>Net</p>
+          <p class={`num text-base sm:text-xl font-bold truncate ${net >= 0 ? 'text-teal-700 dark:text-teal-400' : 'text-orange-700 dark:text-orange-400'}`}>{mga(net)}</p>
+        </div>
+      </div>
+
+      {totalSetAside > 0 && (
+        <p class="text-[11px] text-gray-400 -mt-2 mb-4 text-center">
+          {mga(totalSetAside)} moved into envelopes this week — a move, not spending
+        </p>
+      )}
+
+      {/* Category spending progress — budgeted categories only, THIS MONTH.
+          The bar used to plot one WEEK's spending against a MONTHLY target, so
+          it sat around a quarter full all month long. Overspend is no longer
+          clipped to 100% either: a full red bar with the real figure beside it
+          is the one thing this card exists to say. */}
+      <Card title={`Budget Progress — ${month.label}`} icon="target" className="mb-5">
+        {spendingByCategory.results.length === 0 ? (
+          <p class="text-xs text-gray-400">No category budgets set.</p>
+        ) : (
+          <div class="space-y-3">
+            {spendingByCategory.results.map(cat => {
+              const raw = cat.budget > 0 ? Math.round((cat.spent / cat.budget) * 100) : 0
+              const pct = Math.min(100, raw)
+              const barColor = raw >= 100 ? 'bg-red-500' : raw >= 80 ? 'bg-yellow-400' : 'bg-green-500'
+              // Only a category that has been funded has an envelope balance;
+              // a target on its own is a plan, not money set aside.
+              const env = cat.envelope_from ? envelopeByCategory.get(cat.id) : undefined
+              return (
+                <div>
+                  <div class="flex justify-between text-xs mb-1 gap-2">
+                    <span class="font-medium text-gray-700 dark:text-gray-300">{cat.name}</span>
+                    <span class="text-gray-500 whitespace-nowrap">{mga(cat.spent)} / {mga(cat.budget)}</span>
+                  </div>
+                  <div class="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                    <div class={`h-full rounded-full transition-all ${barColor}`} style={`width:${pct}%`} />
+                  </div>
+                  <div class="flex justify-between gap-2 mt-1 text-[10px]">
+                    <span class="text-gray-400">
+                      {env
+                        ? (env.carriedIn !== 0
+                            ? `Carried ${mga(env.carriedIn)} · Funded ${mga(env.funded)}`
+                            : `Funded ${mga(env.funded)}`)
+                        : (raw > 100 ? `${raw}% of target` : 'Target only')}
+                    </span>
+                    {env && (
+                      <span class={`font-semibold ${env.left < 0 ? 'text-red-500' : 'text-green-600 dark:text-green-400'}`}>
+                        {env.left < 0 ? `${mga(-env.left)} over` : `${mga(env.left)} left`}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </Card>
+
+      {/* Charts */}
+      <div class="grid md:grid-cols-2 gap-4 mb-5">
+        <Card title="Expenses by Group" icon="donut">
+          <div class="w-full max-w-[240px] mx-auto">
+            <canvas id="expenseChart"></canvas>
+          </div>
+        </Card>
+        <Card title="Income by Source" icon="arrow-in">
+          <div class="w-full max-w-[240px] mx-auto">
+            <canvas id="incomeChart"></canvas>
+          </div>
+        </Card>
+      </div>
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+      <script dangerouslySetInnerHTML={{ __html: `
+        function chartLegendColor() {
+          return document.documentElement.classList.contains('dark') ? '#d1d5db' : '#374151';
+        }
+        const expenseCtx = document.getElementById('expenseChart').getContext('2d');
+        const expenseData = ${JSON.stringify(spendingByGroup.results.filter(g => g.spent > 0))};
+        const incomeCtx = document.getElementById('incomeChart').getContext('2d');
+        const incomeData = ${JSON.stringify(incomeBySource.results)};
+        const palette = ['#ef4444','#f97316','#f59e0b','#84cc16','#22c55e','#06b6d4','#3b82f6','#8b5cf6','#d946ef','#f43f5e'];
+        if (expenseData.length) {
+          new Chart(expenseCtx, {
+            type: 'doughnut',
+            data: { labels: expenseData.map(g => g.name), datasets: [{ data: expenseData.map(g => g.spent), backgroundColor: palette, borderWidth: 0 }] },
+            options: { responsive: true, cutout: '62%', plugins: { legend: { position: 'bottom', labels: { color: chartLegendColor(), boxWidth: 12, padding: 8 } } } }
+          });
+        }
+        if (incomeData.length) {
+          new Chart(incomeCtx, {
+            type: 'doughnut',
+            data: { labels: incomeData.map(i => i.name), datasets: [{ data: incomeData.map(i => i.total), backgroundColor: ['#22c55e','#06b6d4','#3b82f6','#8b5cf6','#f59e0b','#f43f5e'], borderWidth: 0 }] },
+            options: { responsive: true, cutout: '62%', plugins: { legend: { position: 'bottom', labels: { color: chartLegendColor(), boxWidth: 12, padding: 8 } } } }
+          });
+        }
+      `}} />
+
+      {/* Transaction list */}
+      <Card title="Transactions" icon="list">
+        {/* Who the dots belong to, taken from the rows on screen rather than
+            from names typed into this page. It used to read "Niri / MaxX"
+            literally, so an admin-created third person got no entry at all and
+            a rename left a stranger's name on the card. Same helper as the row
+            dots, so a colour can never disagree with the legend. */}
+        {(() => {
+          const people = [...new Set(txns.results.map(t => t.added_by_display_name).filter(Boolean))] as string[]
+          if (people.length < 2) return null
+          return (
+            <p class="text-[10px] text-gray-400 mb-3 -mt-1">
+              {people.sort().map((name, i) => (
+                <span class={i ? 'ml-3' : ''}>
+                  <span class={`inline-block w-2 h-2 rounded-full ${userAccentColor(name)} mr-1 align-middle`} />
+                  {name}
+                </span>
+              ))}
+            </p>
+          )
+        })()}
+        {txns.results.length === 0
+          ? <p class="text-sm text-gray-400 text-center py-6">No transactions this week</p>
+          : (
+            <div class="divide-y divide-gray-100 dark:divide-gray-700">
+              {txns.results.map(t => (
+                <div class="flex items-start justify-between gap-2 py-3">
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class={`w-1 h-4 shrink-0 rounded-full ${userAccentColor(t.added_by_display_name)}`} />
+                      <p class="text-sm font-semibold truncate">
+                        {t.description || t.category_name || t.income_account_name || '—'}
+                      </p>
+                      {t.is_recurring ? <span class="text-xs px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 rounded">🔄 Recurring</span> : null}
+                      {t.is_envelope_transfer ? <span class="text-xs px-1.5 py-0.5 bg-violet-100 dark:bg-violet-900/40 text-violet-600 dark:text-violet-400 rounded">→ Envelope</span> : null}
+                    </div>
+                    <p class="text-xs text-gray-400 mt-0.5">
+                      {t.group_name ? `${t.group_name} › ${t.category_name}` : (t.income_account_name || '')}
+                      {' · '}{t.added_by_display_name} · {t.date}
+                    </p>
+                    {t.notes && (
+                      <details class="mt-1">
+                        <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-600">📝 View items</summary>
+                        <pre class="text-xs text-gray-500 dark:text-gray-400 mt-1 whitespace-pre-wrap font-mono bg-gray-50 dark:bg-gray-900 p-2 rounded-lg">{t.notes}</pre>
+                      </details>
+                    )}
+                  </div>
+                  <div class="flex items-center gap-2 shrink-0">
+                    <span class={`text-sm font-bold ${t.type === 'income' ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
+                      {t.type === 'income' ? '+' : '-'}{mga(t.amount)}
+                    </span>
+                    <div class="flex gap-1">
+                      <a href={`/budget/edit/${t.id}`} class="text-xs px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded hover:bg-gray-200 dark:hover:bg-gray-600">✏️</a>
+                      <form method="post" action={`/budget/delete/${t.id}`} style="display:inline"
+                        onsubmit="return confirm('Delete this transaction?')">
+                        <button type="submit" class="text-xs px-2 py-1 bg-red-50 dark:bg-red-900/20 text-red-500 rounded hover:bg-red-100">🗑</button>
+                      </form>
+                      {t.is_recurring === 0 && (
+                        <form method="post" action={`/budget/copy/${t.id}`} style="display:inline">
+                          <button type="submit" class="text-xs px-2 py-1 bg-blue-50 dark:bg-blue-900/20 text-blue-500 rounded hover:bg-blue-100" title="Copy as recurring">🔄</button>
+                        </form>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        }
+      </Card>
+
+    </Layout>
+  )
+})
+
+// ─── GET /budget/add-expense ──────────────────────────────────
+budget.get('/add-expense', async (c) => {
+  const user = c.get('user')
+  const [cats, groups] = await Promise.all([
+    getCategories(c.env.DB),
+    c.env.DB.prepare('SELECT * FROM category_groups ORDER BY sort_order').all<CategoryGroup>(),
+  ])
+
+  // Two hand-offs land on this same form, because the household's part in both
+  // is identical: the priced lines arrive as the rows below, the description
+  // with them, and the category is still empty -- that choice is the whole point
+  // of landing here instead of posting straight into the budget. What differs is
+  // only where the numbers came from, which is what the hidden field carries:
+  //
+  //   ?from_laoka=<week>   the week's MEAL shopping (protein, sides, salads)
+  //   ?from_pantry=<trip>  a pantry shopping trip (staples, household goods)
+  const fromLaoka = Number(c.req.query('from_laoka') || 0)
+  const fromPantry = Number(c.req.query('from_pantry') || 0)
+  const laoka = fromLaoka ? await laokaHandoff(c.env, fromLaoka) : null
+  const pantry = !laoka && fromPantry ? await pantryHandoff(c.env, fromPantry) : null
+  const handoff = laoka || pantry
+  const initialLines = handoff ? handoff.lines : [{ name: '', price: '' }]
+
+  return c.html(
+    <Layout title="Add Expense" user={user} activeTab="budget">
+      <div class="max-w-lg mx-auto">
+        <h2 class="text-xl font-bold mb-5">💳 Add Expense</h2>
+
+        {c.req.query('err') === 'envelope_needs_budget' && (
+          <div class="mb-5 rounded-xl border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-400">
+            An envelope needs a category with a monthly target. Pick a budgeted category, or set a target first in Manage Categories.
+          </div>
+        )}
+
+        {handoff && (
+          <div class="mb-5 rounded-xl border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20 p-3 text-sm">
+            <p class="font-semibold text-green-800 dark:text-green-300">
+              {laoka ? '🛒 Laoka shopping list' : '🧺 Pantry shopping trip'}
+            </p>
+            <p class="mt-1 text-green-700 dark:text-green-400">
+              {handoff.lines.length} bought item{handoff.lines.length === 1 ? '' : 's'}, {noteAmount(handoff.amount)}.
+              Pick the category, check the lines, then save — nothing is written to the budget until you do.
+            </p>
+          </div>
+        )}
+
+        {/* Mode toggle */}
+        <div id="mode-toggle" class="flex gap-2 mb-5 bg-gray-100 dark:bg-gray-800 rounded-xl p-1">
+          <button onclick="showMode('quick')" id="btn-quick"
+            class="flex-1 py-2 rounded-lg text-sm font-semibold bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white">
+            ⚡ Quick Entry
+          </button>
+          <button onclick="showMode('itemized')" id="btn-itemized"
+            class="flex-1 py-2 rounded-lg text-sm font-semibold text-gray-500 dark:text-gray-400">
+            📋 Itemized List
+          </button>
+        </div>
+
+        <form method="post" action="/budget/add-expense" id="expense-form">
+          <input type="hidden" name="mode" id="mode-input" value="quick" />
+
+          <div class="space-y-4">
+            {/* Date */}
+            <div>
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Date</label>
+              <input type="date" name="date" value={localDate()} required
+                class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+            </div>
+
+            {/* Subcategory. Hidden on the itemized pane, which carries a
+                category per batch instead; `required` moves with the pane. */}
+            <div id="field-category">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Category</label>
+              <select name="category_id" id="category-select" required
+                class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500">
+                <option value="">Select subcategory…</option>
+                {groups.results.map(g => (
+                  <optgroup label={g.name}>
+                    {cats.results.filter(c => c.group_id === g.id).map(cat => (
+                      // data-budget lets the Envelope transfer tick hide the
+                      // categories that have no monthly target to fund.
+                      <option value={cat.id} data-budget={cat.target_budget > 0 ? '1' : '0'}>{cat.name}</option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+            </div>
+
+            {/* Envelope funding. Deliberately OFF by default: a normal expense
+                is the common case, and this box changes the meaning of the
+                row (a move, not a purchase). When it is ticked the form drops
+                to Quick mode — funding is one amount, not a receipt. */}
+            <label id="field-envelope" class="flex items-start gap-2.5 rounded-xl border border-violet-200 dark:border-violet-800 bg-violet-50 dark:bg-violet-900/20 p-3 cursor-pointer">
+              <input type="checkbox" name="is_envelope_transfer" id="envelope-transfer" value="1"
+                onchange="envelopeToggle()" class="mt-0.5 accent-violet-600" />
+              <span class="min-w-0">
+                <span class="block text-sm font-semibold text-violet-800 dark:text-violet-300">Envelope transfer</span>
+                <span class="block text-[11px] text-violet-700/80 dark:text-violet-400/80 mt-0.5">
+                  Moves this amount out of the main balance into a budgeted category. The purchases you then make from it are counted in that category only — never twice.
+                </span>
+              </span>
+            </label>
+
+            {/* Description. The itemized pane names each batch instead. */}
+            <div id="field-description">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Name / Description *</label>
+              <input type="text" name="description" id="expense-description" required placeholder="e.g. Snack, Groceries…"
+                value={handoff ? handoff.description : ''}
+                class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+            </div>
+
+            {/* ── QUICK MODE: single amount ── */}
+            <div id="mode-quick">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Amount (MGA)</label>
+              <input type="number" name="amount" id="quick-amount" min="0" step="1" placeholder="0"
+                class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+            </div>
+
+            {/* ── ITEMIZED MODE: one batch per category ── */}
+            {/* A batch is a category, a name and a list of priced lines; its
+                subtotal is the sum of those lines, and SAVING writes one
+                transaction per batch. Entering the groceries, then the
+                motorcycle parts, then the activities is three batches and
+                three rows in the ledger — one form, three categories. */}
+            <div id="mode-itemized" class="hidden">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Batches</label>
+              <div id="batches" class="space-y-3">
+                <div class="batch rounded-2xl border border-gray-200 dark:border-gray-600 p-3" data-batch="0">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-xs font-semibold text-gray-500 dark:text-gray-400 batch-label">Batch 1</span>
+                    {/* Hidden while this is the only batch; every form needs
+                        at least one. */}
+                    <button type="button" class="batch-remove hidden text-xs text-red-400 hover:text-red-600">✕ Remove</button>
+                  </div>
+                  {/* The first batch's lines keep id="line-items", which is
+                      what the smoke suite slices the hand-off pre-fill from. */}
+                  <select class="batch-cat w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm mb-2 focus:outline-none focus:border-green-500" name="b0_category_id">
+                    <option value="">Select subcategory…</option>
+                    {groups.results.map(g => (
+                      <optgroup label={g.name}>
+                        {cats.results.filter(c => c.group_id === g.id).map(cat => (
+                          <option value={cat.id}>{cat.name}</option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                  <input type="text" name="b0_description" value={handoff ? handoff.description : ''}
+                    placeholder="Name / Description — e.g. Groceries"
+                    class="batch-desc w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-green-500" />
+                  <div id="line-items" class="batch-lines space-y-2 mt-2">
+                    {initialLines.map((line) => (
+                      <div class="flex gap-2 line-item">
+                        <input type="text" name="b0_name" value={line.name} placeholder="Item name" class="flex-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-green-500 item-name" />
+                        <input type="number" name="b0_price" value={line.price} placeholder="Price" min="0" step="1" class="w-28 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-green-500 item-price" />
+                        <button type="button" class="line-remove text-red-400 hover:text-red-600 px-2">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                  <div class="flex items-center gap-4 mt-2">
+                    <button type="button" class="batch-add-line text-sm text-green-600 dark:text-green-400 hover:underline">+ Add line</button>
+                    {/* Imports a Laoka two-column CSV (Item,Price) into THIS
+                        batch. Parsed entirely in the browser — the file is
+                        never uploaded and never stored. */}
+                    <button type="button" class="batch-csv text-sm text-gray-500 dark:text-gray-400 hover:underline">⬆ Import CSV</button>
+                  </div>
+                  <div class="flex items-center justify-between bg-gray-50 dark:bg-gray-700 rounded-xl px-3 py-2 mt-2">
+                    <span class="text-xs font-semibold text-gray-700 dark:text-gray-300">Subtotal</span>
+                    <span class="batch-total text-sm font-bold text-red-600">Ar 0</span>
+                  </div>
+                </div>
+              </div>
+              <p id="csv-status" class="hidden text-[11px] mt-2"></p>
+              <button type="button" id="add-batch"
+                class="w-full mt-3 py-2 rounded-xl border border-dashed border-gray-300 dark:border-gray-600 text-sm font-semibold text-gray-500 dark:text-gray-400 hover:border-green-500 hover:text-green-600 transition-colors">+ Add batch</button>
+              <div class="flex items-center justify-between bg-gray-100 dark:bg-gray-700 rounded-xl px-4 py-3 mt-3">
+                <span class="text-sm font-semibold text-gray-700 dark:text-gray-300">Total</span>
+                <span id="itemized-total-display" class="text-lg font-bold text-red-600">Ar 0</span>
+              </div>
+            </div>
+
+            {/* Which week (or trip) these numbers came from, so saving can adopt
+                the expense that source already owns instead of adding a second. */}
+            {laoka && <input type="hidden" name="laoka_week" value={String(laoka.weekId)} />}
+            {pantry && <input type="hidden" name="pantry_trip" value={String(pantry.tripId)} />}
+
+            {/* Notes. Itemized notes are the batch's own lines, so the free-text
+                field would be discarded; it is hidden there rather than
+                pretending to apply. */}
+            <div id="field-notes">
+              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Notes (optional)</label>
+              <textarea name="notes" rows={2} placeholder="Extra details…"
+                class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500 resize-none" />
+            </div>
+
+            <div class="flex gap-2">
+              <button type="submit"
+                class="flex-1 bg-red-600 hover:bg-red-700 text-white font-semibold py-3 rounded-xl transition-colors">
+                Save Expense
+              </button>
+              {/* data-dismiss — the guard warns only if something was typed */}
+              <a href="/budget" data-dismiss="Dismiss this expense? Everything entered will be lost."
+                class="px-4 py-3 rounded-xl bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300 text-sm font-semibold transition-colors">Dismiss</a>
+            </div>
+          </div>
+        </form>
+
+        {/* Deliberately OUTSIDE #expense-form: a file field inside the form would
+            be posted to the Worker along with the entry. */}
+        <input type="file" id="csv-file" accept=".csv,text/csv" class="hidden" />
+      </div>
+
+      <script dangerouslySetInnerHTML={{ __html: `
+        function showMode(m) {
+          const itemized = m === 'itemized';
+          document.getElementById('mode-input').value = m;
+          document.getElementById('mode-quick').classList.toggle('hidden', itemized);
+          document.getElementById('mode-itemized').classList.toggle('hidden', !itemized);
+          document.getElementById('btn-quick').classList.toggle('bg-white', !itemized);
+          document.getElementById('btn-quick').classList.toggle('dark:bg-gray-700', !itemized);
+          document.getElementById('btn-quick').classList.toggle('shadow', !itemized);
+          document.getElementById('btn-quick').classList.toggle('text-gray-500', itemized);
+          document.getElementById('btn-itemized').classList.toggle('bg-white', itemized);
+          document.getElementById('btn-itemized').classList.toggle('dark:bg-gray-700', itemized);
+          document.getElementById('btn-itemized').classList.toggle('shadow', itemized);
+          document.getElementById('btn-itemized').classList.toggle('text-gray-500', !itemized);
+          // The itemized pane carries a category and a name PER BATCH, so the
+          // shared pair (and the free-text notes) would be a second, conflicting
+          // answer. Hide them there, and let "required" follow the pane: a
+          // required control inside a hidden box blocks the OTHER pane's submit,
+          // because the browser cannot focus it to report the error.
+          ['field-category', 'field-description', 'field-notes', 'field-envelope'].forEach(function (id) {
+            const el = document.getElementById(id);
+            if (el) el.classList.toggle('hidden', itemized);
+          });
+          const cat = document.getElementById('category-select');
+          const desc = document.getElementById('expense-description');
+          if (cat) cat.required = !itemized;
+          if (desc) desc.required = !itemized;
+          const batchFields = document.querySelectorAll('.batch-cat, .batch-desc');
+          for (let i = 0; i < batchFields.length; i++) batchFields[i].required = itemized;
+          // Envelope funding is a MOVE — one amount, no lines — so it has no
+          // meaning in a receipt. Untick it on the way into the pane, so a
+          // hidden box can never post a funding transfer with the batches.
+          if (itemized) {
+            const env = document.getElementById('envelope-transfer');
+            if (env) env.checked = false;
+          }
+        }
+        // Filling an envelope is a MOVE, not a purchase: it has one amount and
+        // only a budgeted category can receive it. Ticking the box therefore
+        // drops to Quick mode and hides the categories with no target, rather
+        // than letting a row be saved that cannot mean what the box says.
+        function envelopeToggle() {
+          const on = document.getElementById('envelope-transfer').checked;
+          const toggle = document.getElementById('mode-toggle');
+          const sel = document.querySelector('select[name="category_id"]');
+          if (on) {
+            showMode('quick');
+            toggle.classList.add('hidden');
+            document.getElementById('btn-itemized').classList.add('hidden');
+            if (sel) {
+              Array.from(sel.options).forEach(function (o) {
+                if (!o.value) return;
+                o.hidden = o.dataset.budget !== '1';
+              });
+              const chosen = sel.selectedOptions[0];
+              if (!chosen || chosen.dataset.budget !== '1') sel.value = '';
+            }
+          } else {
+            toggle.classList.remove('hidden');
+            document.getElementById('btn-itemized').classList.remove('hidden');
+            if (sel) Array.from(sel.options).forEach(function (o) { o.hidden = false; });
+          }
+        }
+        // ── Batches ───────────────────────────────────────────────
+        // A batch is a category, a name and a list of lines. The page only DRAWs
+        // the subtotals; the amounts and the itemized notes are derived once, on
+        // the server, from the same fields (src/lib/expense-batches.ts), so
+        // what a subtotal says and what the budget stores cannot disagree.
+        // The argument is the .batch CARD, not its lines box: the index in its
+        // data-batch is what makes the repeated names belong to this batch
+        // (b0_name, b1_name, …), which is how the server pairs a line's name
+        // with its price.
+        function addLineTo(batch, name, price) {
+          const index = batch.getAttribute('data-batch') || '0';
+          const div = document.createElement('div');
+          div.className = 'flex gap-2 line-item';
+          div.innerHTML = '<input type="text" name="b' + index + '_name" placeholder="Item name" class="flex-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-green-500 item-name" />' +
+            '<input type="number" name="b' + index + '_price" placeholder="Price" min="0" step="1" class="w-28 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-green-500 item-price" />' +
+            '<button type="button" class="line-remove text-red-400 hover:text-red-600 px-2">✕</button>';
+          // Optional values, used by the CSV import. Both must be set before the
+          // row is appended so nothing renders mid-edit.
+          if (name !== undefined && name !== null) div.querySelector('.item-name').value = name;
+          if (price !== undefined && price !== null) div.querySelector('.item-price').value = price;
+          batch.querySelector('.batch-lines').appendChild(div);
+          return div;
+        }
+        function firstBatch() {
+          return document.querySelector('#batches .batch');
+        }
+        function allBatches() {
+          return document.querySelectorAll('#batches .batch');
+        }
+        function relabelBatches() {
+          const all = allBatches();
+          for (let i = 0; i < all.length; i++) {
+            const label = all[i].querySelector('.batch-label');
+            if (label) label.textContent = 'Batch ' + (i + 1);
+            const rm = all[i].querySelector('.batch-remove');
+            // A form always keeps at least one batch; remove is for the extras.
+            if (rm) rm.classList.toggle('hidden', all.length < 2);
+          }
+        }
+        function recalcBatches() {
+          let total = 0;
+          const all = allBatches();
+          for (let i = 0; i < all.length; i++) {
+            const prices = all[i].querySelectorAll('.item-price');
+            let sub = 0;
+            for (let j = 0; j < prices.length; j++) sub += Math.round(parseFloat(prices[j].value) || 0);
+            const out = all[i].querySelector('.batch-total');
+            if (out) out.textContent = 'Ar ' + sub.toLocaleString();
+            total += sub;
+          }
+          const grand = document.getElementById('itemized-total-display');
+          if (grand) grand.textContent = 'Ar ' + total.toLocaleString();
+        }
+        // The server renders batch 0; every batch this view adds gets the NEXT
+        // index. Field names never need renumbering when one is removed, and the
+        // route reads whatever indexes it is given.
+        let batchSeq = 1;
+        function addBatch() {
+          const wrap = document.createElement('div');
+          wrap.className = 'batch rounded-2xl border border-gray-200 dark:border-gray-600 p-3';
+          wrap.setAttribute('data-batch', String(batchSeq));
+          wrap.innerHTML =
+            '<div class="flex items-center justify-between mb-2">' +
+              '<span class="text-xs font-semibold text-gray-500 dark:text-gray-400 batch-label">Batch</span>' +
+              '<button type="button" class="batch-remove text-xs text-red-400 hover:text-red-600">✕ Remove</button>' +
+            '</div>' +
+            '<select class="batch-cat w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm mb-2 focus:outline-none focus:border-green-500" name="b' + batchSeq + '_category_id">' +
+              categoryOptions() +
+            '</select>' +
+            '<input type="text" class="batch-desc w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-green-500" name="b' + batchSeq + '_description" placeholder="Name / Description — e.g. Motorcycle parts" />' +
+            '<div class="batch-lines space-y-2 mt-2"></div>' +
+            '<div class="flex items-center gap-4 mt-2">' +
+              '<button type="button" class="batch-add-line text-sm text-green-600 dark:text-green-400 hover:underline">+ Add line</button>' +
+              '<button type="button" class="batch-csv text-sm text-gray-500 dark:text-gray-400 hover:underline">⬆ Import CSV</button>' +
+            '</div>' +
+            '<div class="flex items-center justify-between bg-gray-50 dark:bg-gray-700 rounded-xl px-3 py-2 mt-2">' +
+              '<span class="text-xs font-semibold text-gray-700 dark:text-gray-300">Subtotal</span>' +
+              '<span class="batch-total text-sm font-bold text-red-600">Ar 0</span>' +
+            '</div>';
+          batchSeq += 1;
+          addLineTo(wrap);
+          document.getElementById('batches').appendChild(wrap);
+          relabelBatches();
+          // Carry the pane's "required" flags onto the new controls, or a blank
+          // new batch would skip the browser's own required-field check.
+          showMode(document.getElementById('mode-input').value);
+          recalcBatches();
+          return wrap;
+        }
+        function categoryOptions() {
+          const sel = document.getElementById('category-select');
+          // A new batch borrows the SAME option list the server rendered for the
+          // first one, so adding a batch never needs a second round trip.
+          return sel ? sel.innerHTML : '<option value="">Select subcategory…</option>';
+        }
+
+        // ── Import CSV (Laoka hand-off) ──────────────────────────
+        // Two columns, item name and a positive whole price. The file is read in
+        // the browser and discarded; nothing is uploaded and nothing is stored.
+        // The parser is deliberately tolerant: comma or semicolon, an optional
+        // header row, quoted names, UTF-8 BOM, CRLF, and stray currency text.
+        function csvTitleFromFilename(filename) {
+          // "Laoka_SEP_12__SEP_18(1).csv" -> "Laoka SEP 12 SEP 18"
+          let s = String(filename || '').replace(/[.][A-Za-z0-9]{1,5}$/, '');
+          // Browsers rename repeat downloads with an optional " (1)" counter.
+          s = s.replace(/[(][0-9]+[)]$/, '').replace(/\\s+$/, '');
+          // Hyphens inside a date-shaped run are kept; every other separator
+          // becomes a space, so "Laoka - 2026-09-12" keeps its date readable.
+          const parts = s.split(/([0-9]{4}-[0-9]{1,2}(?:-[0-9]{1,2})?)/);
+          for (let i = 0; i < parts.length; i++) {
+            if (i % 2 === 1) continue;
+            parts[i] = parts[i].replace(/[_\\u2013\\u2014-]+/g, ' ');
+          }
+          return parts.join('').replace(/\\s+/g, ' ').trim().slice(0, 120);
+        }
+        function splitCsvLine(line, delimiter) {
+          const out = [];
+          let cur = '';
+          let quoted = false;
+          for (let i = 0; i < line.length; i++) {
+            const ch = line.charAt(i);
+            if (quoted) {
+              if (ch === '"') {
+                if (line.charAt(i + 1) === '"') { cur += '"'; i++; }
+                else { quoted = false; }
+              } else { cur += ch; }
+            } else if (ch === '"') {
+              quoted = true;
+            } else if (ch === delimiter) {
+              out.push(cur); cur = '';
+            } else {
+              cur += ch;
+            }
+          }
+          out.push(cur);
+          return out;
+        }
+        function parseCsvRows(text) {
+          const rows = [];
+          const skipped = [];
+          let lines = String(text || '').split('\\n');
+          let firstRow = true;
+          let delimiter = ',';
+          for (let i = 0; i < lines.length; i++) {
+            let line = lines[i];
+            if (line.charAt(line.length - 1) === '\\r') line = line.slice(0, -1);
+            if (i === 0 && line.charAt(0) === '\\uFEFF') line = line.slice(1);
+            if (!line.trim()) continue;
+            if (firstRow) {
+              delimiter = line.indexOf(';') !== -1 && line.indexOf(',') === -1 ? ';' : ',';
+              firstRow = false;
+            }
+            const cells = splitCsvLine(line, delimiter);
+            const name = (cells[0] || '').trim();
+            // Keep digits only, so "Ar 3 000", "3,000" and "3000" all read the same.
+            const digits = (cells[1] || '').replace(/[^0-9]/g, '');
+            // The header row ("Item,Price") has no digits in column 2.
+            if (i === 0 && !digits) continue;
+            // A SHORT column 2 followed by a 3-digit column is a thousands
+            // separator that got split ("pork,4,500"), not a third field. Skip and
+            // report rather than silently record Ar 4 for a 4,500 purchase. A
+            // plausible price ("rice,2000,500") keeps column 2 and ignores the rest.
+            let suspicious = false;
+            if (cells.length > 2 && /^[0-9]{1,3}$/.test((cells[1] || '').trim())) {
+              for (let k = 2; k < cells.length; k++) {
+                if (/^[0-9]{3}$/.test(cells[k].trim())) suspicious = true;
+              }
+            }
+            const price = digits ? parseInt(digits, 10) : 0;
+            if (!name || price <= 0 || suspicious) { skipped.push(i + 1); continue; }
+            rows.push({ name: name, price: price });
+          }
+          return { rows: rows, skipped: skipped };
+        }
+        function readFileText(file, cb) {
+          try {
+            if (typeof file.text === 'function') {
+              file.text().then(function (t) { cb(null, t); }, function () { cb(new Error('read failed')); });
+              return;
+            }
+          } catch (e) {}
+          try {
+            const fr = new FileReader();
+            fr.onload = function () { cb(null, String(fr.result || '')); };
+            fr.onerror = function () { cb(new Error('read failed')); };
+            fr.readAsText(file);
+          } catch (e2) {
+            cb(new Error('read failed'));
+          }
+        }
+        function csvSay(message, isError) {
+          const el = document.getElementById('csv-status');
+          if (!el) return;
+          el.textContent = message;
+          el.className = 'text-[11px] mt-2 ' + (isError ? 'text-red-500' : 'text-gray-400 dark:text-gray-500');
+        }
+        // Replaces the lines of ONE batch (the one whose ⬆ Import CSV was
+        // clicked). Returns false when the user cancels.
+        let csvTarget = null;
+        function applyImportedRows(rows, title) {
+          const batch = csvTarget || firstBatch();
+          if (!batch) return false;
+          const box = batch.querySelector('.batch-lines');
+          const existing = Array.from(box.querySelectorAll('.line-item'));
+          const names = Array.from(box.querySelectorAll('.item-name'));
+          const prices = Array.from(box.querySelectorAll('.item-price'));
+          const typed = names.some(function (n) { return n.value.trim() !== ''; }) ||
+                        prices.some(function (p) { return p.value !== ''; });
+          if (typed && !confirm('Replace the ' + existing.length + ' line item(s) in this batch?')) {
+            return false;
+          }
+          existing.forEach(function (row) { row.remove(); });
+          rows.forEach(function (r) { addLineTo(batch, r.name, r.price); });
+          if (!box.querySelector('.line-item')) addLineTo(batch);
+          // The filename is the title; never overwrite a typed description.
+          const desc = batch.querySelector('.batch-desc');
+          if (desc && title && !desc.value.trim()) desc.value = title;
+          recalcBatches();
+          return true;
+        }
+        const csvFile = document.getElementById('csv-file');
+        if (csvFile) {
+          csvFile.addEventListener('change', function () {
+            const file = csvFile.files && csvFile.files[0];
+            if (!file) return;
+            if (file.size > 262144) {
+              csvSay('That file is too big (256 KB limit).', true);
+              csvFile.value = '';
+              return;
+            }
+            readFileText(file, function (err, text) {
+              // Allow the same file to be picked again after a failed attempt.
+              csvFile.value = '';
+              if (err) { csvSay('Could not read that file.', true); return; }
+              const parsed = parseCsvRows(text);
+              if (!parsed.rows.length) {
+                csvSay('No rows with both an item name and a price were found.', true);
+                return;
+              }
+              const capped = parsed.rows.length > 200;
+              const rows = parsed.rows.slice(0, 200);
+              if (!applyImportedRows(rows, csvTitleFromFilename(file.name))) {
+                csvSay('Import cancelled — nothing was changed.', true);
+                return;
+              }
+              let total = 0;
+              for (let i = 0; i < rows.length; i++) total += rows[i].price;
+              let msg = 'Imported ' + rows.length + ' item' + (rows.length === 1 ? '' : 's') +
+                        ' · Ar ' + total.toLocaleString();
+              if (capped) msg += ' · only the first 200 rows were used';
+              if (parsed.skipped.length) {
+                const shown = parsed.skipped.slice(0, 5).join(', ');
+                msg += ' · skipped ' + parsed.skipped.length + ' (line' +
+                       (parsed.skipped.length === 1 ? ' ' : 's ') + shown +
+                       (parsed.skipped.length > 5 ? '…' : '') + ')';
+              }
+              csvSay(msg, false);
+            });
+          });
+        }
+
+        // ── Batch wiring ──────────────────────────────────────────
+        // Delegated, because batches and their lines are added after load.
+        const batchesBox = document.getElementById('batches');
+        if (batchesBox) {
+          batchesBox.addEventListener('click', function (ev) {
+            const t = ev.target;
+            if (!t || !t.closest) return;
+            const addLineBtn = t.closest('.batch-add-line');
+            if (addLineBtn) {
+              addLineTo(addLineBtn.closest('.batch'));
+              return;
+            }
+            const removeLine = t.closest('.line-remove');
+            if (removeLine) {
+              removeLine.closest('.line-item').remove();
+              recalcBatches();
+              return;
+            }
+            const removeBatch = t.closest('.batch-remove');
+            if (removeBatch) {
+              removeBatch.closest('.batch').remove();
+              // Never leave the form with no batch at all: an empty submit reads
+              // as a broken entry, and there would be nothing to type into.
+              if (!batchesBox.querySelector('.batch')) addBatch();
+              relabelBatches();
+              recalcBatches();
+              return;
+            }
+            const csvBtn = t.closest('.batch-csv');
+            if (csvBtn && csvFile) {
+              csvTarget = csvBtn.closest('.batch');
+              csvFile.click();
+            }
+          });
+          // Only a price changes a subtotal.
+          batchesBox.addEventListener('input', function (ev) {
+            const t = ev.target;
+            if (t && t.classList && t.classList.contains('item-price')) recalcBatches();
+          });
+        }
+        const addBatchBtn = document.getElementById('add-batch');
+        if (addBatchBtn) addBatchBtn.addEventListener('click', function () {
+          const batch = addBatch();
+          const desc = batch.querySelector('.batch-desc');
+          if (desc) desc.focus();
+        });
+
+        relabelBatches();
+        recalcBatches();
+        // A Laoka hand-off opens on the mode its lines belong to. Its first batch
+        // is the prefilled receipt; the category stays the household's choice,
+        // and nothing is written until Save.
+        if (${handoff ? 'true' : 'false'}) { showMode('itemized'); recalcBatches(); }
+      `}} />
+    </Layout>
+  )
+})
+
+// ─── POST /budget/add-expense ─────────────────────────────────
+/** How many items an itemized entry holds: one note line each, which is what
+ * the ledger's item_count has always counted. The one-press path passes Laoka's
+ * own line count; a save from the pre-filled form counts what was saved. */
+const itemizedCount = (text: string | null) => (text || '').split('\n').filter(Boolean).length
+
+budget.post('/add-expense', async (c) => {
+  const user = c.get('user')
+  // `all: true` keeps a repeated field (a batch's lines) as an ARRAY; a name
+  // posted once still arrives as a string, so every other field reads as before.
+  const body = await c.req.parseBody({ all: true })
+  const field = (key: string) => {
+    const value = body[key]
+    return Array.isArray(value) ? String(value[0] ?? '') : String(value ?? '')
+  }
+
+  const mode = field('mode') || 'quick'
+  const date = field('date')
+  // The field is OPTIONAL: a hand-off form can be saved without a category, and
+  // `String(undefined)` is the string "undefined" -- which is truthy, reaches the
+  // insert as a category id, and answers 500 (FOREIGN KEY) instead of saving the
+  // expense. A missing field is no category.
+  const categoryId = field('category_id')
+  // Envelope funding is a MOVE, not a purchase: one amount, no receipt lines.
+  // The itemized pane is nothing BUT receipt lines, one transaction per batch,
+  // so the box is hidden there and this refuses it even if a stale or hand-made
+  // post sends it -- a row can never be both a purchase and a move.
+  const isEnvelopeTransfer = mode !== 'itemized' && field('is_envelope_transfer') === '1'
+  const description = field('description').trim() || null
+  // A form the BROWSER submits has every newline normalised to CRLF by the
+  // urlencoded serializer, so the same list typed by hand would be stored with
+  // different bytes than the same list sent by Laoka or the pantry. One shape,
+  // whichever door it came through: parseItemLines tolerates a stray CR, but the
+  // ledger's item_count and the details panel should not have to.
+  const lf = (v: unknown) => String(v || '').replace(/\r\n?/g, '\n')
+  const quickNotes = lf(field('notes')).trim() || null
+
+  // One batch is one transaction. Quick mode is ONE unnamed batch: the typed
+  // number and the shared description.
+  let batches: ExpenseBatch[]
+  if (mode === 'itemized') {
+    batches = readExpenseBatches(body)
+    if (!batches.length) {
+      // A tab opened before the batch deploy posts the old single list; a stale
+      // form must still save rather than lose the receipt it is holding.
+      const legacy = legacyItemizedBatch(body, categoryId || null, description)
+      if (legacy) batches = [legacy]
+    }
+  } else {
+    const amount = parseFloat(field('amount') || '0')
+    if (!amount || amount <= 0) return c.redirect('/budget?err=invalid_amount')
+    batches = [{ categoryId: categoryId || null, description, lines: [], amount, notes: quickNotes }]
+  }
+
+  const laokaWeek = Number(field('laoka_week') || 0)
+  const pantryTrip = Number(field('pantry_trip') || 0)
+  // A Laoka week (or a pantry trip) is ONE expense, and it is the FIRST batch:
+  // the hand-off pre-fills that batch with the shopping's lines. Extra batches
+  // are fine -- they are separate purchases -- but the shopping itself cannot
+  // be empty, or the save would correct the wrong row and spend its identity.
+  if ((laokaWeek || pantryTrip) && (!batches[0] || batches[0].amount <= 0)) {
+    return c.redirect('/budget?err=invalid_amount')
+  }
+
+  // An untouched batch is not an error: "+ Add batch" leaves one empty card
+  // behind whenever somebody changes their mind. It just has no money to save.
+  batches = batches.filter((batch) => batch.amount > 0)
+  if (!batches.length) return c.redirect('/budget?err=invalid_amount')
+
+  // An envelope is a budget that now holds money, so funding one is only
+  // meaningful for a category with a monthly target. The first transfer is
+  // also the moment the envelope OPENS: stamping `envelope_from` with this
+  // row's date is what keeps every earlier purchase in the category counted
+  // as ordinary spending (and the past cash balance unchanged). Only Quick
+  // mode can reach this: itemized mode forces the flag off above.
+  if (isEnvelopeTransfer) {
+    const cat = categoryId
+      ? await c.env.DB.prepare('SELECT target_budget, envelope_from FROM categories WHERE id = ?')
+          .bind(categoryId)
+          .first<{ target_budget: number; envelope_from: string | null }>()
+      : null
+    if (!cat || cat.target_budget <= 0) return c.redirect('/budget/add-expense?err=envelope_needs_budget')
+    if (!cat.envelope_from) {
+      await c.env.DB.prepare('UPDATE categories SET envelope_from = ? WHERE id = ?').bind(date, categoryId).run()
+    }
+  }
+
+  // A save that carries a Laoka week (or a pantry trip) is THAT shopping's
+  // expense, not a new one. If it already has one (sent from the module, or saved
+  // twice from a stale tab), the SAME transaction is corrected -- amount, notes
+  // and items only, never the date, category or description the household chose.
+  // That is the rule the one-press path already follows, and it is what makes this
+  // form safe to resubmit.
+  //
+  // The identity is honoured in BOTH modes, and that is the point: a Quick save is
+  // still a save of the shopping the form was opened for (the household typed one
+  // number instead of checking the lines). Honouring it only on the itemized pane
+  // meant a Quick save left the week or trip looking unsent, so the Pantry tab went
+  // on offering the same shopping -- and a second tap charged the budget twice,
+  // which is the one thing this whole path exists to prevent.
+  // An itemised save counts the lines it carries, which is what the ledger's
+  // item_count has always counted. A Quick save carries no itemized lines at all,
+  // so the count is the source's OWN -- the shopping that was bought -- which is
+  // also the figure the Pantry screen prints as "last trip: … 3 items".
+  const sourceCount = mode === 'itemized'
+    ? itemizedCount(batches[0].notes)
+    : await sourceItemCount(c.env, laokaWeek, pantryTrip, itemizedCount(quickNotes))
+  const plans = batches.map((batch) => ({ id: generateId(), batch }))
+  const source = laokaWeek > 0 || pantryTrip > 0
+  let adopted: string | null = null
+  if (laokaWeek) {
+    const existing = await c.env.HOME_DB.prepare('SELECT transaction_id FROM laoka_imports WHERE laoka_week_id = ?')
+      .bind(laokaWeek)
+      .first<{ transaction_id: string }>()
+    if (existing) {
+      // The ledger is not the proof -- the EXPENSE is. A row pointing at a
+      // transaction somebody deleted in Sompitra must not stop this save from
+      // creating the expense it is trying to be.
+      const live = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?')
+        .bind(existing.transaction_id)
+        .first<{ id: string }>()
+      if (live) adopted = existing.transaction_id
+    }
+  }
+  if (pantryTrip && !adopted) {
+    const existing = await c.env.LAOKA_DB.prepare('SELECT transaction_id FROM pantry_trips WHERE id = ?')
+      .bind(pantryTrip)
+      .first<{ transaction_id: string | null }>()
+    if (existing && existing.transaction_id) {
+      const live = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?')
+        .bind(existing.transaction_id)
+        .first<{ id: string }>()
+      if (live) adopted = existing.transaction_id
+    }
+  }
+
+  // The shopping's row is the FIRST batch. When it already has an expense, that
+  // row is CORRECTED (amount + notes only, never the household's date, category
+  // or description); the extra batches are separate purchases either way.
+  if (source && adopted) {
+    const first = batches[0]
+    if (pantryTrip) await refreshPantryExpense(c.env, pantryTrip, adopted, first.amount, first.notes, sourceCount)
+    else await refreshLaokaExpense(c.env, laokaWeek, adopted, first.amount, first.notes, sourceCount)
+  }
+
+  // Every row that is NOT the corrected shopping becomes a transaction. D1's
+  // batch() is one transaction in the database, so a mid-list failure cannot
+  // leave half of a multi-category entry behind.
+  const created = source && adopted ? plans.slice(1) : plans
+  if (created.length) {
+    await c.env.DB.batch(created.map(({ id, batch }) => c.env.DB.prepare(
+      `INSERT INTO transactions (id, date, amount, type, category_id, description, notes, added_by_user_id, is_envelope_transfer)
+       VALUES (?, ?, ?, 'expense', ?, ?, ?, ?, ?)`
+    ).bind(id, date, batch.amount, batch.categoryId, batch.description, batch.notes, user.id, isEnvelopeTransfer ? 1 : 0)))
+  }
+
+  // The week/trip's ledger follows the batch that IS the shopping. A corrected
+  // row keeps the identity it already had; a new one records it now.
+  if (source && !adopted) {
+    const first = plans[0]
+    const id = first.id
+    if (laokaWeek) {
+      await recordLaokaImport(c.env, laokaWeek, id, first.batch.amount, sourceCount, first.batch.categoryId)
+    }
+    if (pantryTrip) {
+      await markPantryTripPushed(c.env, pantryTrip, id, first.batch.amount, sourceCount)
+    }
+  }
+
+  // Funding is a move inside the household's own money, not an event worth
+  // pushing to a phone: "Expense — Groceries, Ar 200 000" would read as a
+  // shopping trip that never happened. Every CREATED row is a purchase, though,
+  // and each batch is announced once -- a corrected shopping is not news.
+  if (!isEnvelopeTransfer) {
+    for (const plan of created) await notifyTransaction(c.env, plan.id)
+  }
+  return c.redirect('/budget')
+})
+
+// ─── GET /budget/add-income ───────────────────────────────────
+budget.get('/add-income', async (c) => {
+  const user = c.get('user')
+  const accounts = await c.env.DB.prepare(
+    `SELECT ia.*, u.display_name FROM income_accounts ia
+     JOIN users u ON ia.user_id = u.id ORDER BY u.username, ia.name`
+  ).all<IncomeAccount & { display_name: string }>()
+
+  return c.html(
+    <Layout title="Add Income" user={user} activeTab="budget">
+      <div class="max-w-lg mx-auto">
+        <h2 class="text-xl font-bold mb-5">💵 Add Income</h2>
+        <form method="post" action="/budget/add-income" class="space-y-4">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Date</label>
+            <input type="date" name="date" value={localDate()} required
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Income Source</label>
+            <select name="income_account_id" required
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500">
+              <option value="">Select income source…</option>
+              {accounts.results.map(a => (
+                <option value={a.id}>{(a as any).display_name} › {a.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Amount (MGA)</label>
+            <input type="number" name="amount" min="0" step="1" placeholder="0" required
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description *</label>
+            <input type="text" name="description" required placeholder="e.g. July Salary"
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Notes (optional)</label>
+            <textarea name="notes" rows={2}
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500 resize-none" />
+          </div>
+          <div class="flex gap-2">
+            <button type="submit"
+              class="flex-1 bg-green-600 hover:bg-green-700 text-white font-semibold py-3 rounded-xl transition-colors">
+              Save Income
+            </button>
+            {/* data-dismiss — the guard warns only if something was typed */}
+            <a href="/budget" data-dismiss="Dismiss this income? Everything entered will be lost."
+              class="px-4 py-3 rounded-xl bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300 text-sm font-semibold transition-colors">Dismiss</a>
+          </div>
+        </form>
+      </div>
+    </Layout>
+  )
+})
+
+// ─── POST /budget/add-income ──────────────────────────────────
+budget.post('/add-income', async (c) => {
+  const user = c.get('user')
+  const body = await c.req.parseBody()
+  const date = String(body.date)
+  const incomeAccountId = String(body.income_account_id)
+  const amount = parseFloat(String(body.amount || '0'))
+  const description = String(body.description || '').trim() || null
+  const notes = String(body.notes || '').trim() || null
+
+  if (!amount || amount <= 0) return c.redirect('/budget?err=invalid_amount')
+
+  const id = generateId()
+  await c.env.DB.prepare(
+    `INSERT INTO transactions (id, date, amount, type, income_account_id, description, notes, added_by_user_id)
+     VALUES (?, ?, ?, 'income', ?, ?, ?, ?)`
+  ).bind(id, date, amount, incomeAccountId, description, notes, user.id).run()
+
+  await notifyTransaction(c.env, id)
+  return c.redirect('/budget')
+})
+
+// ─── Laoka → Sompitra, without the CSV round trip ─────────────
+//
+// The old hand-off was: Laoka exports a CSV, you download it, open the
+// itemized expense modal, click "Import CSV", pick the file. Four steps and a
+// file, for data both apps already hold. These two endpoints replace it with
+// one press.
+//
+// The rules are copied from Laoka's export so the result matches what the CSV
+// would have produced: only lines with a price above zero, sorted A to Z by
+// item name (case-insensitively), one `Name: Ar 1 234`-style note line each, and
+// the sum in the amount. Laoka truncates prices to whole units; we do too.
+//
+// The ledger lives in home-db (`laoka_imports`) and is keyed by week, so this
+// is idempotent by construction: a second press UPDATES the expense it created
+// instead of adding a second one. That is the difference from the CSV path,
+// which could not detect a double import at all.
+
+/** Money as the itemized notes show it: `Ar 1 234` (comma form, like mga()). */
+function noteAmount(amount: number): string {
+  const n = Math.round(Number.isFinite(amount) ? amount : 0)
+  return 'Ar ' + n.toLocaleString('en-US')
+}
+
+interface LaokaPricedLine { name: string; price: number }
+
+/**
+ * The priced lines of a Laoka week, in the exact order and shape Laoka's own
+ * CSV export uses. Unpriced lines are not bought, so they are not expenses.
+ */
+async function laokaPricedLines(env: Env, weekId: number): Promise<LaokaPricedLine[]> {
+  const { results } = await env.LAOKA_DB.prepare(
+    `SELECT i.name AS name, l.price AS price
+       FROM shopping_lines l
+       JOIN items i ON i.id = l.item_id
+      WHERE l.week_id = ?1 AND l.price IS NOT NULL AND l.price > 0`
+  )
+    .bind(weekId)
+    .all<LaokaPricedLine>()
+  const rows = (results || []).map((r) => ({ name: String(r.name), price: Math.trunc(Number(r.price)) }))
+  rows.sort((a, b) => {
+    const an = a.name.toLowerCase()
+    const bn = b.name.toLowerCase()
+    return an < bn ? -1 : an > bn ? 1 : 0
+  })
+  return rows
+}
+
+/**
+ * Which category a Laoka shopping expense belongs in. Preferred: an explicit
+ * `laoka_category_id` household setting. Otherwise the first category whose
+ * name reads like food shopping, so a normal install files it under Groceries
+ * with no configuration. NULL is a legitimate answer — the expense still
+ * exists and is editable in Sompitra.
+ */
+async function laokaCategoryId(env: Env): Promise<string | null> {
+  try {
+    const set = await env.DB.prepare(`SELECT value FROM app_settings WHERE key = 'laoka_category_id'`).first<{ value: string }>()
+    const wanted = (set?.value || '').trim()
+    if (wanted) {
+      const hit = await env.DB.prepare('SELECT id FROM categories WHERE id = ?').bind(wanted).first<{ id: string }>()
+      if (hit) return hit.id
+    }
+    const guess = await env.DB.prepare(
+      `SELECT id, name FROM categories
+        ORDER BY CASE WHEN lower(name) LIKE '%grocer%' THEN 0
+                      WHEN lower(name) LIKE '%food%' THEN 1
+                      WHEN lower(name) LIKE '%market%' THEN 2
+                      WHEN lower(name) LIKE '%shopping%' THEN 3
+                      ELSE 9 END, sort_order
+        LIMIT 1`
+    ).first<{ id: string; name: string }>()
+    if (guess && /grocer|food|market|shopping/i.test(guess.name)) return guess.id
+  } catch { /* a category is a nicety, never a blocker */ }
+  return null
+}
+
+/** Describe the week the way a person would read it. */
+function laokaDescription(startDate: string, endDate: string): string {
+  return `Laoka shopping ${startDate} \u2013 ${endDate}`
+}
+
+/**
+ * A Laoka week packaged for Sompitra's own add-expense form.
+ *
+ * This is the hand-off that leaves the category to the household: Laoka hands
+ * over the NUMBERS, Sompitra renders the same form a person would fill in by
+ * hand, and nothing exists in the budget until a category is chosen and Save is
+ * pressed. (The one-press `POST /import-laoka` still exists for a week whose
+ * expense is already there and only needs its numbers refreshed.)
+ *
+ * Null when there is nothing to hand over: no such week, or nothing priced in
+ * it yet -- an expense with no lines would be an empty form pretending to be
+ * shopping.
+ */
+async function laokaHandoff(env: Env, weekId: number) {
+  const week = await env.LAOKA_DB.prepare('SELECT id, start_date, end_date FROM weeks WHERE id = ?')
+    .bind(weekId)
+    .first<{ id: number; start_date: string; end_date: string }>()
+  if (!week) return null
+  const lines = await laokaPricedLines(env, weekId)
+  if (!lines.length) return null
+  const amount = lines.reduce((sum, l) => sum + l.price, 0)
+  return { weekId, description: laokaDescription(week.start_date, week.end_date), lines, amount }
+}
+
+/**
+ * A PANTRY TRIP packaged for the same add-expense form: the priced lines of a
+ * shopping trip, and nothing else.
+ *
+ * The pantry is the second domain, and a trip is its week: you go when the
+ * shelves say so, not on a schedule. Its prices live on `pantry_lines` (the trip
+ * they were typed for), so `trip.transaction_id` is the identity that keeps a
+ * pushed purchase from being sent twice -- the module-local twin of
+ * `laoka_imports`, in the module that owns the trip.
+ *
+ * Null when there is nothing to hand over: no such trip, or nothing priced in it.
+ */
+async function pantryHandoff(env: Env, tripId: number) {
+  const trip = await env.LAOKA_DB.prepare(
+    "SELECT id, started_at, pushed_at FROM pantry_trips WHERE id = ?"
+  )
+    .bind(tripId)
+    .first<{ id: number; started_at: string | null; pushed_at: string | null }>()
+  if (!trip) return null
+  const rows = await env.LAOKA_DB.prepare(
+    'SELECT i.id, i.name, p.price, p.qty FROM pantry_lines p ' +
+    'JOIN items i ON i.id = p.item_id AND i.deleted_at IS NULL ' +
+    'WHERE p.trip_id = ? AND p.price IS NOT NULL AND p.price > 0 ' +
+    'ORDER BY i.name COLLATE NOCASE'
+  )
+    .bind(tripId)
+    .all<{ id: number; name: string; price: number; qty: number | null }>()
+  // A line becomes what it COST: the unit price times how many were bought. The
+  // quantity is also written into the name, because an itemized expense is a
+  // receipt -- "toilet paper: Ar 6,000" is right for the money but silent about
+  // the fact that it was two of them, and the household edits this expense later.
+  const lines = (rows.results || []).map((r) => {
+    const qty = r.qty === null || r.qty === undefined ? 1 : Number(r.qty)
+    const unit = Math.trunc(Number(r.price))
+    return { name: qty === 1 ? r.name : `${r.name} ×${qty}`, price: Math.trunc(unit * qty) }
+  })
+  if (!lines.length) return null
+  const amount = lines.reduce((sum, l) => sum + l.price, 0)
+  const day = String(trip.started_at || '').slice(0, 10) || localDate()
+  return { tripId, description: `Pantry shopping ${day}`, lines, amount }
+}
+
+/**
+ * A pantry trip's numbers landing on an expense that already exists. The rule is
+ * Laoka's, because the rule is about what a re-send may touch, not about which
+ * module sent it: correct the MONEY and the ITEMS, never the date, the category
+ * or the description the household chose. And the ledger records what the
+ * expense actually carries -- the category is read back off the transaction.
+ */
+async function refreshPantryExpense(
+  env: Env,
+  tripId: number,
+  transactionId: string,
+  amount: number,
+  notes: string | null,
+  itemCount: number,
+) {
+  await env.DB.prepare('UPDATE transactions SET amount = ?, notes = ? WHERE id = ?')
+    .bind(amount, notes, transactionId)
+    .run()
+  await env.LAOKA_DB.prepare(
+    "UPDATE pantry_trips SET transaction_id = ?, amount = ?, item_count = ? WHERE id = ?"
+  )
+    .bind(transactionId, amount, itemCount, tripId)
+    .run()
+}
+
+/** How many items a QUICK save from a hand-off form represents: the source's own
+ * priced lines -- the shopping that was actually bought -- rather than the lines of
+ * a free-text note. Falls back to the notes when the source has nothing left to
+ * count (a stale tab, or a week whose lines are already gone). */
+async function sourceItemCount(env: Env, weekId: number, tripId: number, fallback: number) {
+  if (weekId) return (await laokaPricedLines(env, weekId)).length || fallback
+  if (tripId) {
+    const handoff = await pantryHandoff(env, tripId)
+    if (handoff) return handoff.lines.length || fallback
+    // The lines are already gone -- this trip has been pushed, and a re-save is
+    // correcting the expense it became. The count the trip already records is the
+    // honest one; answering 0 here would erase it on a re-save.
+    const row = await env.LAOKA_DB.prepare('SELECT item_count FROM pantry_trips WHERE id = ?')
+      .bind(tripId)
+      .first<{ item_count: number | null }>()
+    return (row && row.item_count) ? row.item_count : fallback
+  }
+  return fallback
+}
+
+/** Marks a trip as spent: which expense it became, how much, how many lines, and
+ * when. A pushed trip is history, so its prices go with it -- leaving them
+ * behind is how a half-typed list gets re-sent as if it were a new shop. The
+ * count is written BEFORE they go, because after this the only record of what
+ * was in the trip is the expense itself. */
+async function markPantryTripPushed(env: Env, tripId: number, transactionId: string, amount: number, itemCount: number) {
+  await env.LAOKA_DB.prepare(
+    "UPDATE pantry_trips SET transaction_id = ?, amount = ?, item_count = ?, pushed_at = datetime('now') WHERE id = ?"
+  )
+    .bind(transactionId, amount, itemCount, tripId)
+    .run()
+  await env.LAOKA_DB.prepare('DELETE FROM pantry_lines WHERE trip_id = ?').bind(tripId).run()
+}
+
+/**
+ * Records that a Laoka week's numbers became a Sompitra expense, in the one
+ * ledger that makes the hand-off idempotent (`home-db.laoka_imports`), and marks
+ * the week exported -- the same flag the CSV export sets, so Laoka's "already
+ * exported" warning keeps telling the truth about where the numbers went.
+ *
+ * Called from BOTH doors (the pre-filled form and the one-press refresh) so a
+ * week cannot be recorded two different ways depending on how it was sent.
+ *
+ * `imported_at` is the FIRST send and is never rewritten -- it is the answer to
+ * "when did these numbers leave Laoka", which a refresh does not change.
+ * `updated_at` moves only when the expense is corrected in place, so Laoka's
+ * "sent / updated" line keeps meaning what it says.
+ */
+async function recordLaokaImport(
+  env: Env,
+  weekId: number,
+  transactionId: string,
+  amount: number,
+  itemCount: number,
+  categoryId: string | null,
+  isUpdate = false,
+) {
+  const now = new Date().toISOString()
+  await env.HOME_DB.prepare(
+    `INSERT INTO laoka_imports (laoka_week_id, transaction_id, amount, item_count, category_id, imported_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(laoka_week_id) DO UPDATE SET
+       transaction_id = excluded.transaction_id, amount = excluded.amount,
+       item_count = excluded.item_count, category_id = excluded.category_id,
+       updated_at = excluded.updated_at`
+  )
+    .bind(weekId, transactionId, amount, itemCount, categoryId, now, isUpdate ? now : null)
+    .run()
+  await env.LAOKA_DB.prepare("UPDATE weeks SET exported_at = datetime('now') WHERE id = ?1").bind(weekId).run()
+}
+
+/**
+ * A Laoka week's numbers landing on an expense that already exists.
+ *
+ * Both doors come through here -- a save on the pre-filled form and the
+ * one-press "send again" -- because the rule is the same and it is the subtle
+ * one: correct the MONEY and the ITEMS, and never the date, the category or the
+ * description the household chose. The ledger then records what the expense
+ * ACTUALLY carries: the category is read back off the transaction rather than
+ * taken from whichever submit happened to arrive, so the two cannot disagree.
+ */
+async function refreshLaokaExpense(
+  env: Env,
+  weekId: number,
+  transactionId: string,
+  amount: number,
+  notes: string | null,
+  itemCount: number,
+) {
+  await env.DB.prepare('UPDATE transactions SET amount = ?, notes = ? WHERE id = ?')
+    .bind(amount, notes, transactionId)
+    .run()
+  const live = await env.DB.prepare('SELECT category_id FROM transactions WHERE id = ?')
+    .bind(transactionId)
+    .first<{ category_id: string | null }>()
+  await recordLaokaImport(env, weekId, transactionId, amount, itemCount, live ? live.category_id : null, true)
+}
+
+// Status for the button: has this week already been sent, and to which expense?
+budget.get('/laoka-import', async (c) => {
+  const weekId = Number(c.req.query('week') || 0)
+  if (!weekId) return c.json({ ok: false, error: 'a week id is required' }, 400)
+  const row = await c.env.HOME_DB.prepare(
+    'SELECT transaction_id, amount, item_count, imported_at, updated_at FROM laoka_imports WHERE laoka_week_id = ?'
+  )
+    .bind(weekId)
+    .first<{ transaction_id: string; amount: number; item_count: number; imported_at: string; updated_at: string | null }>()
+  if (!row) return c.json({ ok: true, sent: false })
+  // The expense may have been deleted in Sompitra since. Reporting `sent` for a
+  // transaction that no longer exists is what would make the button lie.
+  const live = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?').bind(row.transaction_id).first<{ id: string }>()
+  return c.json({
+    ok: true,
+    sent: !!live,
+    stale: !live,
+    transactionId: row.transaction_id,
+    amount: row.amount,
+    itemCount: row.item_count,
+    importedAt: row.imported_at,
+    updatedAt: row.updated_at,
+  })
+})
+
+// The one button. Creates the expense, or refreshes the one this week already
+// owns. Returns JSON because the caller is Laoka's single-page app.
+budget.post('/import-laoka', async (c) => {
+  const user = c.get('user')
+  const contentType = c.req.header('content-type') || ''
+  let body: Record<string, unknown> = {}
+  try {
+    body = contentType.includes('application/json')
+      ? ((await c.req.json()) as Record<string, unknown>)
+      : ((await c.req.parseBody()) as Record<string, unknown>)
+  } catch {
+    return c.json({ ok: false, error: 'unreadable request body' }, 400)
+  }
+
+  const weekId = Number(body.week || 0)
+  if (!weekId) return c.json({ ok: false, error: 'a week id is required' }, 400)
+
+  const week = await c.env.LAOKA_DB.prepare('SELECT id, start_date, end_date FROM weeks WHERE id = ?')
+    .bind(weekId)
+    .first<{ id: number; start_date: string; end_date: string }>()
+  if (!week) return c.json({ ok: false, error: 'no such week in Laoka' }, 404)
+
+  const lines = await laokaPricedLines(c.env, weekId)
+  if (!lines.length) {
+    return c.json({ ok: false, error: 'nothing is priced yet, so there is nothing to send' }, 409)
+  }
+
+  const amount = lines.reduce((sum, l) => sum + l.price, 0)
+  // Same shape the itemized modal builds from an imported CSV, so notes read
+  // identically whichever route the numbers arrived by.
+  const notes = lines.map((l) => `${l.name}: ${noteAmount(l.price)}`).join('\n')
+  const description = laokaDescription(week.start_date, week.end_date)
+
+  const existing = await c.env.HOME_DB.prepare('SELECT transaction_id FROM laoka_imports WHERE laoka_week_id = ?')
+    .bind(weekId)
+    .first<{ transaction_id: string }>()
+
+  let transactionId: string | null = null
+  let action: 'created' | 'updated' = 'created'
+
+  if (existing) {
+    const stillThere = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?')
+      .bind(existing.transaction_id)
+      .first<{ id: string }>()
+    if (stillThere) {
+      // Refresh amount + items, but deliberately NOT the date, category or
+      // description: those are the household's own choices once the expense
+      // exists, and re-sending a shopping list must not undo them.
+      await refreshLaokaExpense(c.env, weekId, existing.transaction_id, amount, notes, lines.length)
+      transactionId = existing.transaction_id
+      action = 'updated'
+    }
+  }
+
+  if (!transactionId) {
+    const categoryId = await laokaCategoryId(c.env)
+    const id = generateId()
+    await c.env.DB.prepare(
+      `INSERT INTO transactions (id, date, amount, type, category_id, description, notes, added_by_user_id)
+       VALUES (?, ?, ?, 'expense', ?, ?, ?, ?)`
+    )
+      .bind(id, localDate(), amount, categoryId, description, notes, user.id)
+      .run()
+    transactionId = id
+
+    // `refreshLaokaExpense` already marked the week exported; a fresh insert has
+    // not, so the recorder does it for both.
+    await recordLaokaImport(c.env, weekId, id, amount, lines.length, categoryId)
+  }
+
+  // Announce it to the household chat only the FIRST time. A re-send is a
+  // correction to numbers already announced; repeating the "💸 … Ar 46 700"
+  // line would read as a second purchase, which is exactly the confusion this
+  // endpoint exists to prevent.
+  if (action === 'created') await notifyTransaction(c.env, transactionId)
+
+  return c.json({
+    ok: true,
+    action,
+    transactionId,
+    amount,
+    itemCount: lines.length,
+    weekId,
+    description,
+  })
+})
+
+// ─── GET /budget/edit/:id ─────────────────────────────────────
+budget.get('/edit/:id', async (c) => {
+  const id = c.req.param('id')
+  const user = c.get('user')
+  const t = await c.env.DB.prepare('SELECT * FROM transactions WHERE id = ?').bind(id).first<Transaction>()
+  if (!t) return c.redirect('/budget')
+
+  const groups = await c.env.DB.prepare('SELECT * FROM category_groups ORDER BY sort_order').all<CategoryGroup>()
+  const cats = await getCategories(c.env.DB)
+  const incomeAccounts = await c.env.DB.prepare('SELECT * FROM income_accounts ORDER BY name').all<IncomeAccount>()
+
+  return c.html(
+    <Layout title="Edit Transaction" user={user} activeTab="budget">
+      <Card title="Edit Transaction">
+        {c.req.query('err') === 'envelope_needs_budget' && (
+          <div class="mb-4 rounded-xl border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-400">
+            An envelope needs a category with a monthly target.
+          </div>
+        )}
+        <form method="post" action={`/budget/edit/${id}`} class="space-y-4">
+          <div>
+            <label class="block text-sm font-medium mb-1">Date</label>
+            <input type="date" name="date" value={t.date} required class="w-full rounded-xl bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 p-3" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Amount (MGA)</label>
+            <input type="number" name="amount" value={String(t.amount)} required min="1" step="1" class="w-full rounded-xl bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 p-3" />
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1">Description</label>
+            <input type="text" name="description" value={t.description || ''} class="w-full rounded-xl bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 p-3" />
+          </div>
+          {t.type === 'expense' ? (
+            <div>
+              <label class="block text-sm font-medium mb-1">Category</label>
+              <select name="category_id" required class="w-full rounded-xl bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 p-3">
+                {groups.results.map(g => (
+                  <optgroup label={g.name}>
+                    {cats.results.filter(c => c.group_id === g.id).map(cat => (
+                      <option value={cat.id} selected={cat.id === t.category_id}>{cat.name}</option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              <label class="flex items-start gap-2 mt-3 rounded-xl border border-violet-200 dark:border-violet-800 bg-violet-50 dark:bg-violet-900/20 p-3 cursor-pointer">
+                <input type="checkbox" name="is_envelope_transfer" value="1" checked={t.is_envelope_transfer === 1} class="mt-0.5 accent-violet-600" />
+                <span class="min-w-0">
+                  <span class="block text-sm font-semibold text-violet-800 dark:text-violet-300">Envelope transfer</span>
+                  <span class="block text-[11px] text-violet-700/80 dark:text-violet-400/80 mt-0.5">Money moved into the envelope, not a purchase.</span>
+                </span>
+              </label>
+            </div>
+          ) : (
+            <div>
+              <label class="block text-sm font-medium mb-1">Income Account</label>
+              <select name="income_account_id" required class="w-full rounded-xl bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 p-3">
+                {incomeAccounts.results.map(acc => (
+                  <option value={acc.id} selected={acc.id === t.income_account_id}>{acc.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl transition-colors">Update Transaction</button>
+        </form>
+      </Card>
+    </Layout>
+  )
+})
+
+// ─── POST /budget/edit/:id ────────────────────────────────────
+budget.post('/edit/:id', async (c) => {
+  const id = c.req.param('id')
+  const body = await c.req.parseBody()
+  const date = String(body.date)
+  const amount = parseFloat(String(body.amount))
+  const desc = String(body.description || '')
+  
+  if (!amount || amount <= 0) return c.redirect('/budget?err=invalid_amount')
+
+  const t = await c.env.DB.prepare('SELECT type FROM transactions WHERE id = ?').bind(id).first<{type: string}>()
+  if (!t) return c.redirect('/budget')
+
+  if (t.type === 'expense') {
+    const catId = String(body.category_id)
+    const isTransfer = String(body.is_envelope_transfer || '') === '1'
+    // Same rule as the add form: funding only a budgeted category, and funding
+    // it for the first time opens the envelope at this row's date.
+    if (isTransfer) {
+      const cat = await c.env.DB.prepare('SELECT target_budget, envelope_from FROM categories WHERE id = ?')
+        .bind(catId)
+        .first<{ target_budget: number; envelope_from: string | null }>()
+      if (!cat || cat.target_budget <= 0) return c.redirect(`/budget/edit/${id}?err=envelope_needs_budget`)
+      if (!cat.envelope_from) {
+        await c.env.DB.prepare('UPDATE categories SET envelope_from = ? WHERE id = ?').bind(date, catId).run()
+      }
+    }
+    await c.env.DB.prepare('UPDATE transactions SET date=?, amount=?, description=?, category_id=?, is_envelope_transfer=? WHERE id=?')
+      .bind(date, amount, desc, catId, isTransfer ? 1 : 0, id).run()
+  } else {
+    const incId = String(body.income_account_id)
+    await c.env.DB.prepare('UPDATE transactions SET date=?, amount=?, description=?, income_account_id=? WHERE id=?').bind(date, amount, desc, incId, id).run()
+  }
+
+  return c.redirect('/budget')
+})
+
+// ─── POST /budget/delete/:id ──────────────────────────────────
+budget.post('/delete/:id', async (c) => {
+  const id = c.req.param('id')
+
+  // Reverse debt/credit balance if this was a synced repayment/collection
+  const payment = await c.env.DB.prepare(
+    'SELECT id, account_id, amount FROM debt_credit_payments WHERE synced_transaction_id = ?'
+  ).bind(id).first<{ id: string; account_id: string; amount: number }>()
+  if (payment) {
+    await c.env.DB.prepare(
+      'UPDATE debt_credit_accounts SET current_balance = current_balance + ? WHERE id = ?'
+    ).bind(payment.amount, payment.account_id).run()
+    await c.env.DB.prepare('DELETE FROM debt_credit_payments WHERE id = ?').bind(payment.id).run()
+  }
+
+  // If this was the initial borrow/lend transaction, delete the whole debt/credit
+  const debt = await c.env.DB.prepare(
+    'SELECT id FROM debt_credit_accounts WHERE synced_transaction_id = ?'
+  ).bind(id).first<{ id: string }>()
+  if (debt) {
+    await deleteDebtTxns(c.env.DB, debt.id)
+  }
+
+  await c.env.DB.prepare('DELETE FROM transactions WHERE id = ?').bind(id).run()
+  return c.redirect('/budget')
+})
+
+// ─── POST /budget/copy/:id (1-click recurring copy) ──────────
+budget.post('/copy/:id', async (c) => {
+  const id = c.req.param('id')
+  const user = c.get('user')
+  const original = await c.env.DB.prepare('SELECT * FROM transactions WHERE id = ?').bind(id).first<Transaction>()
+  if (!original) return c.redirect('/budget')
+
+  const today = localDate()
+  const newId = generateId()
+  await c.env.DB.prepare(
+    `INSERT INTO transactions (id, date, amount, type, income_account_id, category_id, description, notes, added_by_user_id, is_recurring)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+  ).bind(newId, today, original.amount, original.type, original.income_account_id, original.category_id,
+    original.description, original.notes, user.id).run()
+
+  return c.redirect('/budget')
+})
+
+// ─── GET /budget/export ───────────────────────────────────────
+budget.get('/export', async (c) => {
+  const weekOffset = parseInt(c.req.query('w') || '0') || 0
+  const { start, end } = currentWeekBounds(weekOffset)
+
+  const txns = await c.env.DB.prepare(
+    `SELECT t.date, t.type, t.amount, t.description, c.name AS category,
+            cg.name AS group_name, ia.name AS income_source, u.display_name AS added_by, t.notes
+     FROM transactions t
+     LEFT JOIN categories c ON t.category_id = c.id
+     LEFT JOIN category_groups cg ON c.group_id = cg.id
+     LEFT JOIN income_accounts ia ON t.income_account_id = ia.id
+     LEFT JOIN users u ON t.added_by_user_id = u.id
+     WHERE t.date BETWEEN ? AND ?
+     ORDER BY t.date DESC`
+  ).bind(start, end).all<any>()
+
+  const rows = txns.results
+  const header = 'Date,Type,Amount (MGA),Description,Category,Group,Income Source,Added By,Notes'
+  const csv = [header, ...rows.map((r: any) =>
+    [r.date, r.type, r.amount, r.description||'', r.category||'', r.group_name||'', r.income_source||'', r.added_by||'', (r.notes||'').replace(/\n/g,' ')].map((v: any) => `"${v}"`).join(',')
+  )].join('\n')
+
+  return new Response(csv, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="sompitra-${start}-${end}.csv"`
+    }
+  })
+})
+
+// ─── GET /budget/categories (manage) ─────────────────────────
+budget.get('/categories', async (c) => {
+  const user = c.get('user')
+  const [groups, cats] = await Promise.all([
+    c.env.DB.prepare('SELECT * FROM category_groups ORDER BY sort_order').all<CategoryGroup>(),
+    getCategories(c.env.DB),
+  ])
+
+  return c.html(
+    <Layout title="Manage Categories" user={user} activeTab="settings">
+      <h2 class="text-xl font-bold mb-5">⚙️ Manage Categories</h2>
+      <div class="grid md:grid-cols-2 gap-4">
+        {/* Add group */}
+        <Card title="Add Category Group">
+          <form method="post" action="/budget/categories/add-group" class="space-y-3">
+            <input type="text" name="name" placeholder="Group name (e.g. Bike 2)" required
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-green-500" />
+            <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white text-sm font-semibold py-2 rounded-xl">Add Group</button>
+          </form>
+        </Card>
+        {/* Add subcategory */}
+        <Card title="Add Subcategory">
+          <form method="post" action="/budget/categories/add-category" class="space-y-3">
+            <select name="group_id" required
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-green-500">
+              <option value="">Select group…</option>
+              {groups.results.map(g => <option value={g.id}>{g.name}</option>)}
+            </select>
+            <input type="text" name="name" placeholder="Subcategory name" required
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-green-500" />
+            <input type="number" name="target_budget" placeholder="Monthly target (MGA, optional)" min="0" step="1"
+              class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-green-500" />
+            <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white text-sm font-semibold py-2 rounded-xl">Add Subcategory</button>
+          </form>
+        </Card>
+      </div>
+      {/* Existing categories */}
+      <Card title="Existing Categories" className="mt-4">
+        {groups.results.map(g => (
+          <div class="mb-4">
+            <p class="text-sm font-bold text-gray-700 dark:text-gray-300 mb-2">{g.name}</p>
+            <div class="space-y-1 pl-3">
+              {cats.results.filter(c => c.group_id === g.id).map(cat => (
+                <div class="flex items-center justify-between py-1 border-b border-gray-100 dark:border-gray-700">
+                  <span class="text-sm">{cat.name}</span>
+                  <div class="flex items-center gap-3">
+                    {cat.target_budget > 0 && <span class="text-xs text-gray-400">{mga(cat.target_budget)}/mo</span>}
+                    <form method="post" action={`/budget/categories/delete/${cat.id}`} onsubmit="return confirm('Delete this category?')">
+                      <button type="submit" class="text-xs text-red-400 hover:text-red-600">🗑</button>
+                    </form>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </Card>
+    </Layout>
+  )
+})
+
+budget.post('/categories/add-group', async (c) => {
+  const body = await c.req.parseBody()
+  const name = String(body.name || '').trim()
+  if (!name) return c.redirect('/budget/categories')
+  const id = generateId()
+  await c.env.DB.prepare('INSERT INTO category_groups (id, name) VALUES (?, ?)').bind(id, name).run()
+  return c.redirect('/budget/categories')
+})
+
+budget.post('/categories/add-category', async (c) => {
+  const body = await c.req.parseBody()
+  const groupId = String(body.group_id || '')
+  const name = String(body.name || '').trim()
+  const target = parseFloat(String(body.target_budget || '0')) || 0
+  if (!name || !groupId) return c.redirect('/budget/categories')
+  const id = generateId()
+  await c.env.DB.prepare('INSERT INTO categories (id, group_id, name, target_budget) VALUES (?, ?, ?, ?)').bind(id, groupId, name, target).run()
+  return c.redirect('/budget/categories')
+})
+
+budget.post('/categories/delete/:id', async (c) => {
+  await c.env.DB.prepare('DELETE FROM categories WHERE id = ?').bind(c.req.param('id')).run()
+  return c.redirect('/budget/categories')
+})
+
+// ─── GET /budget/accounts (manage income accounts) ─────────
+budget.get('/accounts', async (c) => {
+  const user = c.get('user')
+  const [accounts, users] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT ia.*, u.display_name FROM income_accounts ia JOIN users u ON ia.user_id = u.id ORDER BY u.username, ia.name`
+    ).all<IncomeAccount & { display_name: string }>(),
+    c.env.DB.prepare('SELECT * FROM users ORDER BY username').all<User>(),
+  ])
+
+  return c.html(
+    <Layout title="Income Accounts" user={user} activeTab="settings">
+      <h2 class="text-xl font-bold mb-5">💵 Income Accounts</h2>
+
+      <Card title="Add Account" className="mb-5">
+        <form method="post" action="/budget/accounts/add" class="space-y-3">
+          <input type="text" name="name" placeholder="Account name (e.g. Freelance)" required
+            class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-green-500" />
+          <select name="user_id" required
+            class="w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-green-500">
+            <option value="">Assign to…</option>
+            {users.results.map(u => <option value={u.id}>{u.display_name}</option>)}
+          </select>
+          <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white text-sm font-semibold py-2 rounded-xl">Add Account</button>
+        </form>
+      </Card>
+
+      <Card title="Existing Accounts">
+        <div class="space-y-2">
+          {accounts.results.map(a => (
+            <div class="flex items-center justify-between py-2 border-b border-gray-100 dark:border-gray-700 last:border-0">
+              <div>
+                <p class="text-sm font-medium">{a.name}</p>
+                <p class="text-xs text-gray-400">{a.display_name}</p>
+              </div>
+              {a.is_protected
+                ? <span class="text-xs text-gray-400 bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded">🔒 Service-synced</span>
+                : <a href={`/budget/accounts/delete/${a.id}`} class="text-xs px-2 py-1 bg-red-50 dark:bg-red-900/20 hover:bg-red-100 text-red-500 rounded">🗑</a>
+              }
+            </div>
+          ))}
+        </div>
+      </Card>
+    </Layout>
+  )
+})
+
+// ─── POST /budget/accounts/add ──────────────────────────────
+budget.post('/accounts/add', async (c) => {
+  const body = await c.req.parseBody()
+  const name = String(body.name || '').trim()
+  const userId = String(body.user_id || '')
+  if (!name || !userId) return c.redirect('/budget/accounts')
+  const id = generateId()
+  await c.env.DB.prepare('INSERT INTO income_accounts (id, user_id, name) VALUES (?, ?, ?)').bind(id, userId, name).run()
+  return c.redirect('/budget/accounts')
+})
+
+// ─── GET /budget/accounts/delete/:id ────────────────────────
+budget.get('/accounts/delete/:id', async (c) => {
+  const user = c.get('user')
+  const id = c.req.param('id')
+  const account = await c.env.DB.prepare('SELECT * FROM income_accounts WHERE id = ?').bind(id).first<IncomeAccount>()
+  if (!account || account.is_protected) return c.redirect('/budget/accounts')
+
+  const [others, txnCount] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT ia.*, u.display_name FROM income_accounts ia JOIN users u ON ia.user_id = u.id WHERE ia.id != ? ORDER BY u.username, ia.name`
+    ).bind(id).all<IncomeAccount & { display_name: string }>(),
+    c.env.DB.prepare('SELECT COUNT(*) AS cnt FROM transactions WHERE income_account_id = ?').bind(id).first<{ cnt: number }>(),
+  ])
+
+  return c.html(
+    <Layout title="Delete Account" user={user} activeTab="settings">
+      <div class="max-w-lg mx-auto">
+        <h2 class="text-xl font-bold mb-5">🗑 Delete Account</h2>
+        <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">
+          You are about to delete <strong>{account.name}</strong>. It has <strong>{txnCount?.cnt ?? 0}</strong> income transaction(s).
+        </p>
+        <form method="post" action={`/budget/accounts/delete/${id}`} class="space-y-4">
+          <label class="flex items-start gap-3 p-4 rounded-xl border border-gray-200 dark:border-gray-600 cursor-pointer">
+            <input type="radio" name="action" value="transfer" checked class="mt-0.5 accent-green-600" />
+            <div class="flex-1">
+              <p class="text-sm font-semibold">Transfer to another account</p>
+              <select name="transfer_to"
+                class="mt-2 w-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 py-2 text-sm">
+                {others.results.map(o => <option value={o.id}>{o.display_name} › {o.name}</option>)}
+              </select>
+            </div>
+          </label>
+          <label class="flex items-start gap-3 p-4 rounded-xl border border-gray-200 dark:border-gray-600 cursor-pointer">
+            <input type="radio" name="action" value="drop" class="mt-0.5 accent-red-600" />
+            <div>
+              <p class="text-sm font-semibold">Drop transactions completely</p>
+              <p class="text-xs text-gray-400">Deletes all income transactions linked to this account.</p>
+            </div>
+          </label>
+          <button type="submit" class="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-3 rounded-xl">Delete Account</button>
+          <a href="/budget/accounts" class="block text-center text-sm text-gray-500 hover:underline">Cancel</a>
+        </form>
+      </div>
+    </Layout>
+  )
+})
+
+// ─── POST /budget/accounts/delete/:id ───────────────────────
+budget.post('/accounts/delete/:id', async (c) => {
+  const id = c.req.param('id')
+  const account = await c.env.DB.prepare('SELECT * FROM income_accounts WHERE id = ?').bind(id).first<IncomeAccount>()
+  if (!account || account.is_protected) return c.redirect('/budget/accounts')
+
+  const body = await c.req.parseBody()
+  const action = String(body.action || 'transfer')
+
+  if (action === 'transfer') {
+    const transferTo = String(body.transfer_to || '')
+    if (transferTo) {
+      await c.env.DB.prepare('UPDATE transactions SET income_account_id = ? WHERE income_account_id = ?').bind(transferTo, id).run()
+    }
+  } else {
+    await c.env.DB.prepare('DELETE FROM transactions WHERE income_account_id = ?').bind(id).run()
+  }
+
+  await c.env.DB.prepare('DELETE FROM income_accounts WHERE id = ?').bind(id).run()
+  return c.redirect('/budget/accounts')
+})
+
+// ─── GET /budget/reports ─────────────────────────────────────
+budget.get('/reports', async (c) => {
+  const user = c.get('user')
+  const periodKey = c.req.query('p') || 'this_week'
+  const fromParam = c.req.query('from') || ''
+  const toParam = c.req.query('to') || ''
+  // Which report is on screen. A query parameter, not a setting: every visit
+  // (and every link that does not carry it) starts from the full view, so a
+  // one-off look at groups can never leave the page stuck in group mode.
+  const reportView = c.req.query('v') === 'group' ? 'group'
+    : c.req.query('v') === 'category' ? 'category' : 'overall'
+  // Which series the trend chart plots. Three views over the SAME buckets, so
+  // switching never changes the shape of the axis — only which bars are drawn.
+  const chartView = c.req.query('cv') === 'income' ? 'income'
+    : c.req.query('cv') === 'expense' ? 'expense' : 'both'
+  let start: string, end: string, label: string
+  if (periodKey === 'custom') {
+    start = fromParam
+    end = toParam
+    label = start && end ? `${start} → ${end}` : 'Custom Range'
+  } else {
+    ({ start, end, label } = reportPeriod(periodKey))
+  }
+
+  const [summary, expensesByGroup, expensesByCategory, incomeBySource, perUser, trendData] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount END),0) AS income,
+              COALESCE(SUM(CASE WHEN type='expense' AND is_envelope_transfer=0 THEN amount END),0) AS expense,
+              COUNT(*) AS cnt
+       FROM transactions WHERE date BETWEEN ? AND ?`
+    ).bind(start, end).first<{ income: number; expense: number; cnt: number }>(),
+    c.env.DB.prepare(
+      `SELECT cg.name, COALESCE(SUM(t.amount),0) AS total
+       FROM transactions t JOIN categories c ON t.category_id = c.id JOIN category_groups cg ON c.group_id = cg.id
+       WHERE t.type='expense' AND t.is_envelope_transfer=0 AND t.date BETWEEN ? AND ? GROUP BY cg.id ORDER BY total DESC`
+    ).bind(start, end).all<{ name: string; total: number }>(),
+    c.env.DB.prepare(
+      `SELECT c.name, cg.name AS group_name, COALESCE(SUM(t.amount),0) AS total
+       FROM transactions t JOIN categories c ON t.category_id = c.id JOIN category_groups cg ON c.group_id = cg.id
+       WHERE t.type='expense' AND t.is_envelope_transfer=0 AND t.date BETWEEN ? AND ?
+       GROUP BY c.id ORDER BY total DESC`
+    ).bind(start, end).all<{ name: string; group_name: string; total: number }>(),
+    c.env.DB.prepare(
+      `SELECT ia.name, COALESCE(SUM(t.amount),0) AS total
+       FROM transactions t JOIN income_accounts ia ON t.income_account_id = ia.id
+       WHERE t.type='income' AND t.date BETWEEN ? AND ? GROUP BY ia.id ORDER BY total DESC`
+    ).bind(start, end).all<{ name: string; total: number }>(),
+    c.env.DB.prepare(
+      `SELECT u.display_name,
+              COALESCE(SUM(CASE WHEN t.type='income' THEN t.amount ELSE 0 END),0) AS income,
+              COALESCE(SUM(CASE WHEN t.type='expense' AND t.is_envelope_transfer=0 THEN t.amount ELSE 0 END),0) AS expense
+       FROM transactions t JOIN users u ON t.added_by_user_id = u.id
+       WHERE t.date BETWEEN ? AND ? GROUP BY u.id ORDER BY u.username`
+    ).bind(start, end).all<{ display_name: string; income: number; expense: number }>(),
+    getTrend(c.env.DB, start, end, periodKey),
+  ])
+
+  const trend = trendData.rows
+  const income   = summary?.income ?? 0
+  const expense  = summary?.expense ?? 0
+  const net      = income - expense
+  const totalExp = expensesByGroup.results.reduce((s, g) => s + g.total, 0)
+
+  // Per-category detail for the report. The doughnut answers "which pot";
+  // this answers "which line inside it", so the rows keep their group as a
+  // heading — a category name like Sakafo repeats across groups and would be
+  // ambiguous on its own. Groups are ranked by spend, categories inside them
+  // too. Every bar is drawn against the period's total expenses, so its
+  // length and the percentage beside it say the same thing: a row holding a
+  // tenth of the spend covers a tenth of the track. Each row keeps a 1%
+  // sliver so a near-zero category is still a visible mark rather than a gap.
+  const categoryGroups: { name: string; total: number; rows: { name: string; total: number }[] }[] = []
+  for (const row of expensesByCategory.results) {
+    let group = categoryGroups.find(g => g.name === row.group_name)
+    if (!group) {
+      group = { name: row.group_name, total: 0, rows: [] }
+      categoryGroups.push(group)
+    }
+    group.total += row.total
+    group.rows.push({ name: row.name, total: row.total })
+  }
+  categoryGroups.sort((a, b) => b.total - a.total)
+
+  // ── Comparison (current vs previous period, per category group) ──
+  const cmpMode = c.req.query('cm') === 'month' ? 'month' : 'week'
+  const caParam = c.req.query('ca') || ''
+  const cbParam = c.req.query('cb') || ''
+  let caKey = ''
+  let cbKey = ''
+  let cmpA: { start: string; end: string; label: string }
+  let cmpB: { start: string; end: string; label: string }
+  if (cmpMode === 'month') {
+    // Month keys are the household cycle's END month, so the picker's
+    // "October" is 24 Sep → 23 Oct, the month that money was for. The header
+    // keeps the short form: two month columns share 9.5rem of a phone screen.
+    const shortMonth = (key: string) => new Date(key + '-01T00:00:00Z')
+      .toLocaleDateString('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' })
+    caKey = /^\d{4}-\d{2}$/.test(caParam) ? caParam : monthKeyOf(localDate())
+    cbKey = /^\d{4}-\d{2}$/.test(cbParam) ? cbParam : shiftMonthKey(caKey, -1)
+    cmpA = { ...monthBounds(caKey), label: shortMonth(caKey) }
+    cmpB = { ...monthBounds(cbKey), label: shortMonth(cbKey) }
+  } else {
+    const wa = currentWeekBounds(0)
+    const wb = currentWeekBounds(-1)
+    cmpA = { start: wa.start, end: wa.end, label: 'This week' }
+    cmpB = { start: wb.start, end: wb.end, label: 'Last week' }
+  }
+
+  const cmpRaw = await c.env.DB.prepare(
+    `SELECT cg.id, cg.name,
+       COALESCE(SUM(CASE WHEN t.type='expense' AND t.is_envelope_transfer=0 AND t.date BETWEEN ? AND ? THEN t.amount ELSE 0 END),0) AS a_total,
+       COALESCE(SUM(CASE WHEN t.type='expense' AND t.is_envelope_transfer=0 AND t.date BETWEEN ? AND ? THEN t.amount ELSE 0 END),0) AS b_total
+     FROM category_groups cg
+     LEFT JOIN categories c ON c.group_id = cg.id
+     LEFT JOIN transactions t ON t.category_id = c.id
+     GROUP BY cg.id ORDER BY cg.sort_order`
+  ).bind(cmpA.start, cmpA.end, cmpB.start, cmpB.end).all<{ id: string; name: string; a_total: number; b_total: number }>()
+
+  const cmpRows = cmpRaw.results.map(r => {
+    const a = r.a_total
+    const b = r.b_total
+    let icon = '–'
+    let text = ''
+    let cls = 'text-gray-300 dark:text-gray-600'
+    if (a === 0 && b === 0) {
+      icon = '–'; text = ''
+    } else if (b === 0) {
+      icon = '🆕'; text = 'new'; cls = 'text-red-500'
+    } else if (a === b) {
+      icon = '🔄️'; text = '0%'; cls = 'text-gray-400'
+    } else {
+      const pct = ((a - b) / b) * 100
+      const abs = Math.abs(pct)
+      if (pct > 0) {
+        icon = '⬆️'
+        text = abs.toFixed(0) + '%'
+        cls = abs > 50 ? 'text-red-500' : abs >= 30 ? 'text-yellow-500' : abs >= 10 ? 'text-orange-500' : 'text-blue-500'
+      } else {
+        icon = '⬇️'
+        text = abs.toFixed(0) + '%'
+        cls = 'text-green-600 dark:text-green-400'
+      }
+    }
+    return { id: r.id, name: r.name, a, b, icon, text, cls }
+  })
+
+  const reportBase = 'p=' + periodKey + (periodKey === 'custom' ? '&from=' + fromParam + '&to=' + toParam : '') + '&v=' + reportView
+
+  return c.html(
+    <Layout title="Reports" user={user} activeTab="budget">
+
+      {/* Sub-nav */}
+      <div class="flex gap-1 mb-4 bg-gray-100 dark:bg-gray-800 rounded-xl p-1">
+        <a href="/budget" class="flex-1 text-center py-2 rounded-lg text-sm font-medium text-gray-500 dark:text-gray-400">📋 Overview</a>
+        <a href="/budget/reports" class="flex-1 text-center py-2 rounded-lg text-sm font-semibold bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white">📈 Reports</a>
+        <a href="/budget/transactions" class="flex-1 text-center py-2 rounded-lg text-sm font-medium text-gray-500 dark:text-gray-400">📄 History</a>
+      </div>
+
+      {/* Period + report view. One form, so changing either keeps the other.
+          The view is a URL parameter only — nothing is stored, and the next
+          visit starts from Overall. */}
+      <form method="get" action="/budget/reports" class="mb-2">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <label class="block">
+            <span class="t-micro">Period</span>
+            <select name="p" onchange="this.form.submit()"
+              class="w-full rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-3 py-2.5 text-sm focus:outline-none focus:border-green-500">
+              <option value="this_week" selected={periodKey === 'this_week'}>This Week (SAT–FRI)</option>
+              <option value="last_week" selected={periodKey === 'last_week'}>Last Week (SAT–FRI)</option>
+              <option value="last_7_days" selected={periodKey === 'last_7_days'}>Last 7 Days</option>
+              <option value="this_month" selected={periodKey === 'this_month'}>This Month</option>
+              <option value="last_month" selected={periodKey === 'last_month'}>Last Month</option>
+              <option value="last_30_days" selected={periodKey === 'last_30_days'}>Last 30 Days</option>
+              <option value="this_year" selected={periodKey === 'this_year'}>This Year</option>
+              <option value="all" selected={periodKey === 'all'}>All Time</option>
+              <option value="custom" selected={periodKey === 'custom'}>Custom Range…</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="t-micro">Report</span>
+            <select name="v" onchange="this.form.submit()"
+              class="w-full rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-3 py-2.5 text-sm focus:outline-none focus:border-green-500">
+              <option value="overall" selected={reportView === 'overall'}>Overall</option>
+              <option value="group" selected={reportView === 'group'}>By group</option>
+              <option value="category" selected={reportView === 'category'}>By category</option>
+            </select>
+          </label>
+        </div>
+        {periodKey === 'custom' && <input type="hidden" name="from" value={fromParam} />}
+        {periodKey === 'custom' && <input type="hidden" name="to" value={toParam} />}
+        <p class="text-xs text-gray-400 mt-1">📅 {label}</p>
+      </form>
+
+      {/* Custom range + export */}
+      <div class="flex gap-2 mb-4 items-center">
+        <form method="get" action="/budget/reports" class="flex gap-2 flex-1 min-w-0">
+          <input type="hidden" name="p" value="custom" />
+          <input type="hidden" name="v" value={reportView} />
+          <input type="date" name="from" value={fromParam}
+            class="flex-1 min-w-0 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-2 py-2 text-xs sm:text-sm" />
+          <input type="date" name="to" value={toParam}
+            class="flex-1 min-w-0 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-2 py-2 text-xs sm:text-sm" />
+          <button type="submit" class="px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-sm font-medium whitespace-nowrap">Apply</button>
+        </form>
+        <a href={`/budget/reports/export?p=${periodKey}${periodKey === 'custom' ? `&from=${fromParam}&to=${toParam}` : ''}`}
+          class="px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-sm font-semibold whitespace-nowrap">⬇ CSV</a>
+      </div>
+
+      {/* Summary */}
+      <div class="grid grid-cols-3 gap-2 mb-4">
+        <div class="bg-green-50 dark:bg-green-900/20 rounded-2xl p-3 text-center border border-green-100 dark:border-green-800">
+          <p class="text-[12px] text-green-700 dark:text-green-400 font-semibold">Income</p>
+          <p class="text-base sm:text-xl font-bold text-green-700 dark:text-green-400 truncate">{mga(income)}</p>
+        </div>
+        <div class="bg-red-50 dark:bg-red-900/20 rounded-2xl p-3 text-center border border-red-100 dark:border-red-800">
+          <p class="text-[12px] text-red-700 dark:text-red-400 font-semibold">Expenses</p>
+          <p class="text-base sm:text-xl font-bold text-red-700 dark:text-red-400 truncate">{mga(expense)}</p>
+        </div>
+        {/* Teal is the app's "net" colour (the main budget summary, the dashboard's
+            Net Worth). Blue here meant "net" on this one screen only — the same
+            fact in two colours, which is the thing the money palette exists to
+            stop. Negative keeps orange ("we owe"), as everywhere. */}
+        <div class={`rounded-2xl p-3 text-center border ${net >= 0 ? 'bg-teal-50 dark:bg-teal-900/20 border-teal-100 dark:border-teal-800' : 'bg-orange-50 dark:bg-orange-900/20 border-orange-100 dark:border-orange-800'}`}>
+          <p class={`text-[12px] font-semibold ${net >= 0 ? 'text-teal-700 dark:text-teal-400' : 'text-orange-700 dark:text-orange-400'}`}>Net</p>
+          <p class={`text-base sm:text-xl font-bold truncate ${net >= 0 ? 'text-teal-700 dark:text-teal-400' : 'text-orange-700 dark:text-orange-400'}`}>{mga(net)}</p>
+        </div>
+      </div>
+
+      {/* Trend chart: one set of buckets, three views over it. "Both" keeps
+          the comparison; the other two isolate one side and keep the same
+          weekly/monthly bins, so a month of expenses and a month of income
+          can each be read on their own without a second x-axis. */}
+      {reportView === 'overall' && (
+      <Card title={chartView === 'expense' ? 'Expenses' : chartView === 'income' ? 'Income' : 'Income vs Expenses'} icon="trend" className="mb-4">
+        <div class="flex gap-1 mb-3 bg-gray-100 dark:bg-gray-800 rounded-xl p-1">
+          <a href={`/budget/reports?${reportBase}&cv=both`}
+            class={`flex-1 text-center py-1.5 rounded-lg text-xs font-semibold ${chartView === 'both' ? 'bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-400'}`}>Both</a>
+          <a href={`/budget/reports?${reportBase}&cv=expense`}
+            class={`flex-1 text-center py-1.5 rounded-lg text-xs font-semibold ${chartView === 'expense' ? 'bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-400'}`}>Expenses</a>
+          <a href={`/budget/reports?${reportBase}&cv=income`}
+            class={`flex-1 text-center py-1.5 rounded-lg text-xs font-semibold ${chartView === 'income' ? 'bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-400'}`}>Income</a>
+        </div>
+        <div class="w-full">
+          <canvas id="trendChart"></canvas>
+        </div>
+        {/* The view's own totals, under the bars they describe: switching to
+            Expenses or Income no longer means scrolling back up to the summary
+            tiles to find out what the series adds up to. Net only belongs to
+            the comparison view — a single series has nothing to net against. */}
+        <div class="flex flex-wrap items-baseline justify-center gap-x-4 gap-y-1 mt-2 pt-2 hairline">
+          {chartView !== 'expense' && (
+            <p class="t-micro flex items-baseline gap-1.5 whitespace-nowrap">
+              <span class="font-semibold">Income</span>
+              <span class="num text-[13px] font-bold text-green-600 dark:text-green-400">{mga(income)}</span>
+            </p>
+          )}
+          {chartView !== 'income' && (
+            <p class="t-micro flex items-baseline gap-1.5 whitespace-nowrap">
+              <span class="font-semibold">Expenses</span>
+              <span class="num text-[13px] font-bold text-red-500">{mga(expense)}</span>
+            </p>
+          )}
+          {chartView === 'both' && (
+            <p class="t-micro flex items-baseline gap-1.5 whitespace-nowrap">
+              <span class="font-semibold">Net</span>
+              <span class={`num text-[13px] font-bold ${net >= 0 ? 'text-teal-600 dark:text-teal-400' : 'text-orange-600 dark:text-orange-400'}`}>{mga(net)}</span>
+            </p>
+          )}
+        </div>
+        {trendData.granularity === 'week' && trend.length > 0 && (
+          <p class="text-[10px] text-gray-400 text-center mt-1">Each bar is a SAT–FRI week; the first and last may be partial</p>
+        )}
+        {trend.length === 0 && <p class="text-sm text-gray-400 text-center py-4">No data for this period</p>}
+      </Card>
+      )}
+
+      {/* Category / source doughnuts */}
+      {reportView === 'overall' && (
+      <div class="grid md:grid-cols-2 gap-4 mb-4">
+        <Card title="Expenses by Group" icon="donut">
+          <div class="w-full max-w-[240px] mx-auto">
+            <canvas id="expenseChart"></canvas>
+          </div>
+          {expensesByGroup.results.length === 0 && <p class="text-sm text-gray-400 text-center py-4">No expenses</p>}
+        </Card>
+        <Card title="Income by Source" icon="arrow-in">
+          <div class="w-full max-w-[240px] mx-auto">
+            <canvas id="incomeChart"></canvas>
+          </div>
+          {incomeBySource.results.length === 0 && <p class="text-sm text-gray-400 text-center py-4">No income</p>}
+        </Card>
+      </div>
+      )}
+
+      {/* Per user */}
+      {reportView === 'overall' && (
+      <Card title="By User" icon="people" className="mb-4">
+        <div class="grid grid-cols-2 gap-2">
+          {perUser.results.map(u => (
+            <div class="rounded-xl border border-gray-100 dark:border-gray-700 p-3">
+              <p class="text-sm font-semibold flex items-center gap-1.5 mb-2">
+                <span class={`w-2 h-2 rounded-full ${userAccentColor(u.display_name)}`} />
+                {u.display_name}
+              </p>
+              <p class="text-xs text-green-600 dark:text-green-400">+ {mga(u.income)}</p>
+              <p class="text-xs text-red-500">- {mga(u.expense)}</p>
+              <p class={`text-xs font-semibold mt-1 ${u.income - u.expense >= 0 ? 'text-teal-600 dark:text-teal-400' : 'text-orange-500'}`}>
+                Net {mga(u.income - u.expense)}
+              </p>
+            </div>
+          ))}
+          {perUser.results.length === 0 && <p class="text-sm text-gray-400 text-center py-4 col-span-2">No data</p>}
+        </div>
+      </Card>
+      )}
+
+      {/* Group breakdown — the whole of the group report, the first half of the
+          full one. */}
+      {reportView !== 'category' && expensesByGroup.results.length > 0 && (
+        <Card title={reportView === 'group' ? 'By Group' : 'Expense Breakdown'} icon="receipt">
+          <div class="divide-y divide-gray-100 dark:divide-gray-700">
+            {expensesByGroup.results.map(g => {
+              const pct = totalExp > 0 ? Math.round((g.total / totalExp) * 100) : 0
+              const width = totalExp > 0 ? Math.max(1, (g.total / totalExp) * 100) : 0
+              return (
+                <div class="py-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-sm text-gray-700 dark:text-gray-300 truncate">{g.name}</span>
+                    <div class="flex items-center gap-3 shrink-0">
+                      <span class="text-xs text-gray-400">{pct}%</span>
+                      <span class="text-sm font-semibold text-gray-700 dark:text-gray-300">{mga(g.total)}</span>
+                    </div>
+                  </div>
+                  <div class="mt-1 h-[3px] rounded-full overflow-hidden" style={{ backgroundColor: 'var(--rule)' }}>
+                    <span class="block h-full rounded-full bg-red-400" style={{ width: `${width}%` }} />
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+          <p class="text-[10px] text-gray-400 mt-3 leading-relaxed">Bars show each group's share of the period's expenses.</p>
+        </Card>
+      )}
+
+      {/* The category report, grouped and ranked. Deliberately NOT part of the
+          overall view: the dropdown is what makes it a report you ask for,
+          not an extra that always lengthens the page. */}
+      {reportView === 'category' && categoryGroups.length > 0 && (
+        <Card title="By Category" icon="bars" className="mt-4">
+          <div class="space-y-3.5">
+            {categoryGroups.map(g => (
+              <div>
+                <div class="flex items-baseline justify-between gap-2 pb-1 hairline">
+                  <span class="t-label truncate">{g.name}</span>
+                  <span class="t-micro tabular-nums whitespace-nowrap">{mga(g.total)}</span>
+                </div>
+                <div class="space-y-1.5 pt-1.5">
+                  {g.rows.map(r => {
+                    const share = totalExp > 0 ? (r.total / totalExp) * 100 : 0
+                    const width = totalExp > 0 ? Math.max(1, (r.total / totalExp) * 100) : 0
+                    return (
+                      <div>
+                        <div class="flex items-baseline justify-between gap-3 text-xs">
+                          <span class="truncate text-gray-700 dark:text-gray-300">{r.name}</span>
+                          <span class="shrink-0 tabular-nums text-gray-500 dark:text-gray-400">
+                            {mga(r.total)}
+                            <span class="inline-block w-7 ml-1.5 text-right text-gray-400 dark:text-gray-500">{share < 1 ? '<1' : Math.round(share)}%</span>
+                          </span>
+                        </div>
+                        <div class="mt-1 h-[3px] rounded-full overflow-hidden" style={{ backgroundColor: 'var(--rule)' }}>
+                          <span class="block h-full rounded-full bg-red-400" style={{ width: `${width}%` }} />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+          <p class="text-[10px] text-gray-400 mt-3 leading-relaxed">Bars show each category's share of the period's expenses.</p>
+        </Card>
+      )}
+      {reportView === 'category' && categoryGroups.length === 0 && (
+        <Card title="By Category" icon="bars" className="mt-4">
+          <p class="text-sm text-gray-400 text-center py-4">No expenses in this period</p>
+        </Card>
+      )}
+
+      {/* Comparison — groups against groups, so it belongs to the full and
+          group reports, not the category one. */}
+      {reportView !== 'category' && (
+      <Card title="Comparison" icon="swap" className="mt-4">
+        {/* Mode toggle */}
+        <div class="flex gap-1 mb-3 bg-gray-100 dark:bg-gray-800 rounded-xl p-1">
+          <a href={`/budget/reports?${reportBase}&cm=week`}
+            class={`flex-1 text-center py-1.5 rounded-lg text-xs font-semibold ${cmpMode === 'week' ? 'bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-400'}`}>Weekly</a>
+          <a href={`/budget/reports?${reportBase}&cm=month`}
+            class={`flex-1 text-center py-1.5 rounded-lg text-xs font-semibold ${cmpMode === 'month' ? 'bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-400'}`}>Monthly</a>
+        </div>
+
+        {cmpMode === 'month' && (
+          <form method="get" action="/budget/reports" class="flex gap-2 mb-3">
+            <input type="hidden" name="p" value={periodKey} />
+            <input type="hidden" name="v" value={reportView} />
+            {periodKey === 'custom' && <input type="hidden" name="from" value={fromParam} />}
+            {periodKey === 'custom' && <input type="hidden" name="to" value={toParam} />}
+            <input type="hidden" name="cm" value="month" />
+            <input type="month" name="ca" value={caKey}
+              class="flex-1 min-w-0 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-2 py-2 text-xs sm:text-sm" />
+            <input type="month" name="cb" value={cbKey}
+              class="flex-1 min-w-0 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-2 py-2 text-xs sm:text-sm" />
+            <button type="submit" class="px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 text-sm font-medium whitespace-nowrap">Go</button>
+          </form>
+        )}
+
+        {/* Header */}
+        <div class="grid grid-cols-[1fr_4.75rem_4.75rem_4rem] gap-1 items-center pb-2 hairline t-micro font-semibold">
+          <span>Category</span>
+          <span class="text-right">{cmpA.label}</span>
+          <span class="text-right">{cmpB.label}</span>
+          <span class="text-right">Status</span>
+        </div>
+
+        {/* Rows */}
+        <div class="divide-y divide-gray-100 dark:divide-gray-700">
+          {cmpRows.map(r => (
+            <div class="grid grid-cols-[1fr_4.75rem_4.75rem_4rem] gap-1 items-center py-2 text-xs sm:text-sm">
+              <span class="truncate text-gray-700 dark:text-gray-300">{r.name}</span>
+              <span class="text-right font-medium text-gray-700 dark:text-gray-300">{r.a.toLocaleString('en-US')}</span>
+              <span class="text-right text-gray-400">{r.b.toLocaleString('en-US')}</span>
+              <span class={`text-right font-semibold whitespace-nowrap ${r.cls}`}>{r.icon}{r.text}</span>
+            </div>
+          ))}
+        </div>
+        <p class="text-[10px] text-gray-400 mt-3 leading-relaxed">
+          Amounts in MGA. ⬆️ increase — <span class="text-blue-500">blue ≤10%</span> · <span class="text-orange-500">orange 10–30%</span> · <span class="text-yellow-500">yellow 30–50%</span> · <span class="text-red-500">red &gt;50%</span>. ⬇️ decrease in <span class="text-green-600 dark:text-green-400">green</span>. 🔄️ unchanged.
+        </p>
+      </Card>
+      )}
+
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+      <script dangerouslySetInnerHTML={{ __html: `
+        function rColor() { return document.documentElement.classList.contains('dark') ? '#d1d5db' : '#374151'; }
+        const palette = ['#ef4444','#f97316','#f59e0b','#84cc16','#22c55e','#06b6d4','#3b82f6','#8b5cf6','#d946ef','#f43f5e'];
+        const trend = ${JSON.stringify(trend)};
+        const chartView = ${JSON.stringify(chartView)};
+        const weekly = ${JSON.stringify(trendData.granularity === 'week')};
+        const expData = ${JSON.stringify(expensesByGroup.results)};
+        const incData = ${JSON.stringify(incomeBySource.results)};
+        const common = { responsive: true, cutout: '62%', plugins: { legend: { position: 'bottom', labels: { color: rColor(), boxWidth: 12, padding: 8 } } } };
+
+        // A WEEKLY bar carries its own amount above it: five bars in a card are
+        // wide enough to read a figure, and that figure is the first thing asked
+        // of a bar. Daily bars do NOT — a week's or a month's worth of them
+        // turns the plot into a picket fence, so the totals row under the chart
+        // remains the only place to read a day.
+        if (weekly) {
+          const compact = function (v) {
+            if (v >= 1000000) return (Math.round(v / 10000) / 100) + 'M';
+            if (v >= 1000) return Math.round(v / 1000) + 'k';
+            return String(v);
+          };
+          Chart.register({
+            id: 'barValues',
+            afterDatasetsDraw: function (chart) {
+              if (chart.config.type !== 'bar') return;
+              const ctx = chart.ctx;
+              const size = chart.width < 420 ? 8 : 9;
+              chart.data.datasets.forEach(function (ds, di) {
+                const meta = chart.getDatasetMeta(di);
+                if (meta.hidden) return;
+                meta.data.forEach(function (bar, i) {
+                  const v = ds.data[i];
+                  if (!v) return;
+                  ctx.save();
+                  ctx.font = '700 ' + size + 'px "Plus Jakarta Sans", system-ui, sans-serif';
+                  ctx.fillStyle = rColor();
+                  ctx.textAlign = 'center';
+                  ctx.textBaseline = 'bottom';
+                  ctx.fillText(compact(v), bar.x, bar.y - 3);
+                  ctx.restore();
+                });
+              });
+            }
+          });
+        }
+
+        const trendEl = document.getElementById('trendChart');
+        if (trend.length && trendEl) {
+          const datasets = [];
+          if (chartView !== 'expense') datasets.push({ label: 'Income', data: trend.map(t => t.income), backgroundColor: '#22c55e', borderRadius: 4 });
+          if (chartView !== 'income') datasets.push({ label: 'Expense', data: trend.map(t => t.expense), backgroundColor: '#ef4444', borderRadius: 4 });
+          new Chart(trendEl, {
+            type: 'bar',
+            data: { labels: trend.map(t => t.bucket), datasets },
+            options: {
+              responsive: true,
+              // Weekly bars each state their own amount, so a tick ladder 0→600k
+              // beside them only repeats the labels and steals width. Daily and
+              // monthly bars have no per-bar amount, so the axis stays.
+              // grace leaves room above the tallest bar for its amount.
+              scales: {
+                x: { ticks: { color: rColor() }, grid: { display: false } },
+                y: { display: !weekly, grace: weekly ? '12%' : undefined, ticks: { color: rColor() } }
+              },
+              // A single series names its own colour on the card title, so the
+              // legend would only repeat it.
+              plugins: { legend: { display: datasets.length > 1, labels: { color: rColor() } } }
+            }
+          });
+        }
+        const expEl = document.getElementById('expenseChart');
+        if (expData.length && expEl) {
+          new Chart(expEl, {
+            type: 'doughnut',
+            data: { labels: expData.map(g => g.name), datasets: [{ data: expData.map(g => g.total), backgroundColor: palette, borderWidth: 0 }] },
+            options: common
+          });
+        }
+        const incEl = document.getElementById('incomeChart');
+        if (incData.length && incEl) {
+          new Chart(incEl, {
+            type: 'doughnut',
+            data: { labels: incData.map(i => i.name), datasets: [{ data: incData.map(i => i.total), backgroundColor: ['#22c55e','#06b6d4','#3b82f6','#8b5cf6','#f59e0b','#f43f5e'], borderWidth: 0 }] },
+            options: common
+          });
+        }
+      `}} />
+    </Layout>
+  )
+})
+
+// ─── GET /budget/reports/export ──────────────────────────────
+budget.get('/reports/export', async (c) => {
+  const periodKey = c.req.query('p') || 'this_week'
+  const fromParam = c.req.query('from') || ''
+  const toParam = c.req.query('to') || ''
+  let start: string, end: string
+  if (periodKey === 'custom') {
+    start = fromParam
+    end = toParam
+  } else {
+    const r = reportPeriod(periodKey)
+    start = r.start
+    end = r.end
+  }
+
+  const txns = await c.env.DB.prepare(
+    `SELECT t.date, t.type, t.amount, t.description, c.name AS category,
+            cg.name AS group_name, ia.name AS income_source, u.display_name AS added_by, t.notes
+     FROM transactions t
+     LEFT JOIN categories c ON t.category_id = c.id
+     LEFT JOIN category_groups cg ON c.group_id = cg.id
+     LEFT JOIN income_accounts ia ON t.income_account_id = ia.id
+     LEFT JOIN users u ON t.added_by_user_id = u.id
+     WHERE t.date BETWEEN ? AND ?
+     ORDER BY t.date DESC`
+  ).bind(start, end).all<any>()
+
+  const header = 'Date,Type,Amount (MGA),Description,Category,Group,Income Source,Added By,Notes'
+  const csv = [header, ...txns.results.map((r: any) =>
+    [r.date, r.type, r.amount, r.description || '', r.category || '', r.group_name || '', r.income_source || '', r.added_by || '', (r.notes || '').replace(/\n/g, ' ')]
+      .map((v: any) => `"${String(v).replace(/"/g, '""')}"`).join(',')
+  )].join('\n')
+
+  return new Response(csv, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="sompitra-report-${start}-${end}.csv"`
+    }
+  })
+})
+
+// ─── GET /budget/transactions (all transactions, paginated) ──
+// The itemised form writes notes as one "name: Ar 1,200" line per item, so the
+// History detail view can render them as a list. Returns null for free-form
+// notes, and the caller falls back to plain text with line breaks kept.
+function parseItemLines(notes: string | null): { name: string; amount: string }[] | null {
+  const lines = (notes || '').split('\n').map(l => l.trim()).filter(Boolean)
+  if (!lines.length) return null
+  const items: { name: string; amount: string }[] = []
+  for (const line of lines) {
+    const m = line.match(/^(.*?):\s*Ar\s*([\d,]+)$/)
+    if (!m) return null
+    items.push({ name: m[1].trim(), amount: m[2] })
+  }
+  return items
+}
+
+budget.get('/transactions', async (c) => {
+  const user = c.get('user')
+  const periodKey = c.req.query('p') || 'all'
+  const fromParam = c.req.query('from') || ''
+  const toParam = c.req.query('to') || ''
+  const page = Math.max(1, parseInt(c.req.query('page') || '1') || 1)
+  const perPage = 30
+
+  let start: string, end: string, label: string
+  if (periodKey === 'custom') {
+    start = fromParam; end = toParam; label = start && end ? `${start} → ${end}` : 'Custom Range'
+  } else {
+    ({ start, end, label } = reportPeriod(periodKey))
+  }
+
+  const [txns, countRow] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT t.*, c.name AS category_name, cg.name AS group_name, ia.name AS income_account_name, u.display_name AS added_by_display_name
+       FROM transactions t
+       LEFT JOIN categories c ON t.category_id = c.id
+       LEFT JOIN category_groups cg ON c.group_id = cg.id
+       LEFT JOIN income_accounts ia ON t.income_account_id = ia.id
+       LEFT JOIN users u ON t.added_by_user_id = u.id
+       WHERE t.date BETWEEN ? AND ?
+       ORDER BY t.date DESC, t.created_at DESC
+       LIMIT ? OFFSET ?`
+    ).bind(start, end, perPage, (page - 1) * perPage).all<Transaction>(),
+    c.env.DB.prepare('SELECT COUNT(*) AS cnt FROM transactions WHERE date BETWEEN ? AND ?').bind(start, end).first<{ cnt: number }>(),
+  ])
+
+  const total = countRow?.cnt ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / perPage))
+  const baseQuery = 'p=' + periodKey + (periodKey === 'custom' ? '&from=' + fromParam + '&to=' + toParam : '')
+
+  return c.html(
+    <Layout title="Transaction History" user={user} activeTab="budget">
+
+      {/* Sub-nav */}
+      <div class="flex gap-1 mb-4 bg-gray-100 dark:bg-gray-800 rounded-xl p-1">
+        <a href="/budget" class="flex-1 text-center py-2 rounded-lg text-sm font-medium text-gray-500 dark:text-gray-400">📋 Overview</a>
+        <a href="/budget/reports" class="flex-1 text-center py-2 rounded-lg text-sm font-medium text-gray-500 dark:text-gray-400">📈 Reports</a>
+        <a href="/budget/transactions" class="flex-1 text-center py-2 rounded-lg text-sm font-semibold bg-white dark:bg-gray-700 shadow text-gray-900 dark:text-white">📄 History</a>
+      </div>
+
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-xl font-bold">📄 Transaction History</h2>
+      </div>
+
+      {/* Filter */}
+      <form method="get" action="/budget/transactions" class="mb-2">
+        <select name="p" onchange="this.form.submit()"
+          class="w-full rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-3 py-2.5 text-sm focus:outline-none focus:border-green-500">
+          <option value="this_week" selected={periodKey === 'this_week'}>This Week (SAT–FRI)</option>
+          <option value="last_week" selected={periodKey === 'last_week'}>Last Week (SAT–FRI)</option>
+          <option value="last_7_days" selected={periodKey === 'last_7_days'}>Last 7 Days</option>
+          <option value="this_month" selected={periodKey === 'this_month'}>This Month</option>
+          <option value="last_month" selected={periodKey === 'last_month'}>Last Month</option>
+          <option value="last_30_days" selected={periodKey === 'last_30_days'}>Last 30 Days</option>
+          <option value="this_year" selected={periodKey === 'this_year'}>This Year</option>
+          <option value="all" selected={periodKey === 'all'}>All Time</option>
+          <option value="custom" selected={periodKey === 'custom'}>Custom Range…</option>
+        </select>
+        <p class="text-xs text-gray-400 mt-1">📅 {label} · {total} transaction(s)</p>
+      </form>
+
+      {/* Custom range */}
+      <form method="get" action="/budget/transactions" class="flex gap-2 mb-4">
+        <input type="hidden" name="p" value="custom" />
+        <input type="date" name="from" value={fromParam}
+          class="flex-1 min-w-0 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-2 py-2 text-xs sm:text-sm" />
+        <input type="date" name="to" value={toParam}
+          class="flex-1 min-w-0 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 px-2 py-2 text-xs sm:text-sm" />
+        <button type="submit" class="px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 text-sm font-medium whitespace-nowrap">Apply</button>
+      </form>
+
+      {/* List */}
+      {txns.results.length === 0
+        ? <p class="text-sm text-gray-400 text-center py-8">No transactions found.</p>
+        : (
+          <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 divide-y divide-gray-100 dark:divide-gray-700">
+            {txns.results.map(t => {
+              const items = parseItemLines(t.notes)
+              return (
+                <div>
+                  <div class="flex items-start justify-between gap-2 py-3 px-4">
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center gap-2 flex-wrap">
+                        <span class={`w-1 h-4 shrink-0 rounded-full ${userAccentColor(t.added_by_display_name)}`} />
+                        <p class="text-sm font-semibold truncate">{t.description || t.category_name || t.income_account_name || '—'}</p>
+                      </div>
+                      <p class="text-xs text-gray-400 mt-0.5">
+                        {t.group_name ? `${t.group_name} › ${t.category_name}` : (t.income_account_name || '')}
+                        {' · '}{t.added_by_display_name} · {t.date}
+                      </p>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                      <span class={`text-sm font-bold ${t.type === 'income' ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
+                        {t.type === 'income' ? '+' : '-'}{mga(t.amount)}
+                      </span>
+                      {/* 👁️ details — at most one row stays expanded (see the script below) */}
+                      <button type="button" data-tx-toggle={t.id} aria-expanded="false" title="Show details"
+                        class="text-xs px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded hover:bg-gray-200 dark:hover:bg-gray-600">👁️</button>
+                      <a href={`/budget/edit/${t.id}`} class="text-xs px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded hover:bg-gray-200 dark:hover:bg-gray-600">✏️</a>
+                      <form method="post" action={`/budget/delete/${t.id}`} style="display:inline" onsubmit="return confirm('Delete this transaction?')">
+                        <button type="submit" class="text-xs px-2 py-1 bg-red-50 dark:bg-red-900/20 text-red-500 rounded hover:bg-red-100">🗑</button>
+                      </form>
+                    </div>
+                  </div>
+
+                  {/* Details panel — hidden until 👁️ is pressed */}
+                  <div data-tx-details={t.id} class="hidden px-4 pb-3">
+                    {items && (
+                      <div class="rounded-xl bg-gray-50 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-700 p-3">
+                        <p class="text-[10px] font-semibold text-gray-400 mb-2">{items.length} item{items.length === 1 ? '' : 's'}</p>
+                        <div class="space-y-1">
+                          {items.map(it => (
+                            <div class="flex items-baseline justify-between gap-3 text-xs">
+                              <span class="text-gray-600 dark:text-gray-300 truncate">{it.name}</span>
+                              <span class="text-gray-500 dark:text-gray-400 whitespace-nowrap">Ar {it.amount}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {!items && t.notes && (
+                      <div class="rounded-xl bg-gray-50 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-700 p-3">
+                        <p class="text-[10px] font-semibold text-gray-400 mb-1">Notes</p>
+                        <p class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-line">{t.notes}</p>
+                      </div>
+                    )}
+                    <div class="mt-2 text-[11px] text-gray-400 space-y-0.5">
+                      <p>
+                        {t.type === 'income' ? 'Income' : 'Expense'}
+                        {t.is_recurring === 1 ? ' · 🔄 Recurring' : ''}
+                        {t.group_name ? ` · ${t.group_name} › ${t.category_name}` : ''}
+                        {!t.group_name && t.income_account_name ? ` · ${t.income_account_name}` : ''}
+                      </p>
+                      <p>
+                        Added by {t.added_by_display_name} · logged {String(t.created_at || '').slice(0, 10)}
+                        {String(t.created_at || '').length > 10 ? ` at ${String(t.created_at).slice(11, 16)}` : ''}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )
+      }
+
+      {/* 👁️ Row details — at most ONE row is expanded at a time, so opening a
+          row retracts whichever was open before. The icon flips to 🙈 while a
+          row is open, and aria-expanded carries the state for screen readers. */}
+      <script dangerouslySetInnerHTML={{ __html: `
+        (function () {
+          function reset(panel, btn) {
+            panel.classList.add('hidden');
+            btn.textContent = '👁️';
+            btn.setAttribute('aria-expanded', 'false');
+            btn.setAttribute('title', 'Show details');
+          }
+          document.addEventListener('click', function (ev) {
+            var btn = ev.target && ev.target.closest ? ev.target.closest('[data-tx-toggle]') : null;
+            if (!btn) return;
+
+            var id = btn.getAttribute('data-tx-toggle');
+            var target = null;
+            var panels = document.querySelectorAll('[data-tx-details]');
+            var btns = document.querySelectorAll('[data-tx-toggle]');
+            for (var i = 0; i < panels.length; i++) {
+              if (panels[i].getAttribute('data-tx-details') === id && panels[i].classList.contains('hidden')) {
+                target = panels[i];
+              }
+            }
+            // Retract everything first: this is what keeps exactly one open.
+            for (var j = 0; j < panels.length; j++) {
+              var b = btns[j];
+              if (b) reset(panels[j], b);
+            }
+            if (!target) return;   // the pressed row was already open -> just closed
+
+            target.classList.remove('hidden');
+            btn.textContent = '🙈';
+            btn.setAttribute('aria-expanded', 'true');
+            btn.setAttribute('title', 'Hide details');
+          });
+        })();
+      `}} />
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div class="flex items-center justify-between mt-4">
+          <a href={page > 1 ? `/budget/transactions?${baseQuery}&page=${page - 1}` : '#'}
+            class={`px-3 py-1.5 rounded-lg text-sm font-medium ${page > 1 ? 'bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700' : 'opacity-40 pointer-events-none bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700'}`}>◀ Prev</a>
+          <span class="text-sm text-gray-500">Page {page} of {totalPages}</span>
+          <a href={page < totalPages ? `/budget/transactions?${baseQuery}&page=${page + 1}` : '#'}
+            class={`px-3 py-1.5 rounded-lg text-sm font-medium ${page < totalPages ? 'bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700' : 'opacity-40 pointer-events-none bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700'}`}>Next ▶</a>
+        </div>
+      )}
+    </Layout>
+  )
+})
+
+export default budget
+
+
+
+

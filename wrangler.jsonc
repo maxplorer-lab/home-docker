@@ -1,0 +1,100 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "home",
+  "main": "src/index.tsx",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+
+  // ────────────────────────────────────────────────────────
+  // ONE Worker, THREE modules, ONE login, TWO databases.
+  //
+  //   Sompitra (finance suite, Hono JSX SSR) → served at /
+  //   W.A.Y    (GPS tracking + chat, DO)     → served at /way/*
+  //   Laoka    (meal planner, vanilla SPA)   → served at /laoka/*
+  //
+  // The whole thing is branded "Home" — one app for the whole household.
+  // The login is ONE username + password per person, created by an admin,
+  // stored in the central home-db. On login the Worker provisions the
+  // person into each module (first time only) and mints every module's
+  // session cookie — see src/identity.ts.
+  //
+  // The four original databases (home-db, sompitra-db, way-db, laoka) were
+  // merged into these TWO on 2026-10-06. A binding PAIR points at one physical
+  // database: the bindings stay separate because each module's code asks for
+  // its own, and the tables that would have collided carry the owning module's
+  // prefix (way_users, laoka_users, laoka_sessions).
+  //
+  //   HOME_DB + WAY_DB    home-db      identity (users + sessions — the login)
+  //                                    AND W.A.Y (way_users, gps_pings,
+  //                                    messages, geofences, …)
+  //   DB      + LAOKA_DB  sompitra-db  Sompitra finance (users, sessions,
+  //                                    transactions, …) AND Laoka
+  //                                    (laoka_users, laoka_sessions, weeks, …)
+  //
+  // Durable Objects:
+  //   FLEET_DO → W.A.Y live fleet + chat
+  //   LOBBY    → Laoka realtime fan-out (metadata only)
+  // ────────────────────────────────────────────────────────
+
+  "vars": {
+    "APP_NAME": "Home",
+    // Laoka's password hashing cost. Deliberately low for the free plan's
+    // 10 ms CPU limit — the AUTH_PEPPER secret carries the real strength.
+    "PBKDF2_ITERATIONS": "5000",
+    // Push notifications go to the self-hosted ntfy instance, not public
+    // ntfy.sh (its free quota silently drops messages when hit). Self-hosted
+    // behind a DuckDNS name. This is only the THIRD layer of the resolution:
+    // home-db's home_settings.ntfy_server wins, then the legacy per-module
+    // copies (way-db app_settings.ntfy_url, Sompitra's ntfy_server).
+    "NTFY_URL": "https://maxxntfy.duckdns.org"
+  },
+
+  // Static assets served by the edge BEFORE the Worker runs:
+  //   /sw.js, /manifest.webmanifest, /favicon.svg, /icons/*  → Home/Sompitra PWA
+  //   /way/manifest.json, /way/sw.js, /way/icon-512.png …    → WAY PWA bits
+  //   /laoka/*                                               → Laoka SPA files
+  //
+  // Everything in run_worker_first is either a socket, an ingest endpoint or a
+  // DOCUMENT the Worker has to decide about (/live is the public one: it needs
+  // its noindex header and must never be handed out by the edge unlabelled).
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/ws", "/laoka-ws", "/ulogger", "/ulogger/*", "/way/", "/way/index.html", "/laoka/", "/laoka/index.html", "/chat", "/chat/", "/chat/index.html", "/live", "/live/", "/live/index.html", "/live/api/*", "/meds", "/meds/*"],
+    "not_found_handling": "none"
+  },
+
+  // TWO databases behind four bindings. HOME_DB and WAY_DB share the id of the
+  // (pre-existing) home-db; DB and LAOKA_DB share sompitra-db's. The superseded
+  // `way-db` (e098df3d) and `laoka` (24acf3ed) databases were folded into these
+  // on 2026-10-06 and are kept only as rollback copies — remove them once the
+  // merged pair has proved itself in production.
+  //
+  // Create one with:  wrangler d1 create <name>   → then paste its id here.
+  "d1_databases": [
+    { "binding": "HOME_DB", "database_name": "home-db", "database_id": "fd140c5d-ce90-40eb-a35d-5fc265e4cdf8" },
+    { "binding": "WAY_DB", "database_name": "home-db", "database_id": "fd140c5d-ce90-40eb-a35d-5fc265e4cdf8" },
+    { "binding": "DB", "database_name": "sompitra-db", "database_id": "701cd942-a736-442c-bd00-265061101494" },
+    { "binding": "LAOKA_DB", "database_name": "sompitra-db", "database_id": "701cd942-a736-442c-bd00-265061101494" }
+  ],
+
+  // W.A.Y's Fleet DO (live tracking/chat) and Laoka's Lobby DO (fan-out).
+  "durable_objects": {
+    "bindings": [
+      { "name": "FLEET_DO", "class_name": "FleetDO" },
+      { "name": "LOBBY", "class_name": "Lobby" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["FleetDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["Lobby"] }
+  ],
+
+  // Daily flush of the fleet DO's buffers into way-db at 21:00 UTC ==
+  // 00:00 UTC+3 (Antananarivo midnight). This cron IS the "today" boundary
+  // for WAY's dashboard — do NOT move it to UTC midnight.
+  "triggers": {
+    "crons": ["0 21 * * *"]
+  }
+}
